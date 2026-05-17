@@ -400,18 +400,16 @@ X black background for nanopilot UI
 
 X Address vertical climb issue.
 X fix skating rink effect.
-  - Test horizontalVelocityDecay of 0.35 
+  X Test horizontalVelocityDecay of 0.35 
 
 X Angular drag: adding angular drag (e.g., velocity_decay <angular>) to the model.sdf or the BetaflightPlugin would contribute to more realistic rotational dynamics
 
 X Fix Yaw Speed.
 X 640x480
 
+X drone loses altitude slowly during forward flight, how to compensate??
 
-
-- drone loses altitude slowly during forward flight, how to compensate??
-
-- increase horizontal damping to 0.35.
+X increase horizontal damping to 0.35.
 
 - Surface more configs in the UI.
   - max throttle range.

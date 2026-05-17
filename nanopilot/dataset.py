@@ -58,13 +58,22 @@ class TubDataset(Dataset):
         Raw accel is ~±10-20 m/s^2, Gyro is ~±5 rad/s.
         We scale them down so they are in a similar magnitude to the [0, 1] image pixels.
         """
+        # COORDINATE SYSTEM ALIGNMENT:
+        # If the drone rolls when it should pitch, your IMU axes are likely swapped (NED vs ENU).
+        # Standard NED (Expected): X=Forward, Y=Right, Z=Down
+        # Standard ENU: X=Right, Y=Forward, Z=Up
+        
+        # To fix a 90-degree swap (ENU -> NED):
+        val_x, val_y, val_z = imu_data[1], imu_data[0], imu_data[2]
+        gyro_x, gyro_y, gyro_z = imu_data[4], imu_data[3], imu_data[5]
+
         normalized = np.array([
-            imu_data[0] / self.IMU_SCALES['accel'], # acl_x
-            imu_data[1] / self.IMU_SCALES['accel'], # acl_y
-            imu_data[2] / self.IMU_SCALES['accel'], # acl_z
-            imu_data[3] / self.IMU_SCALES['gyro'],  # gyr_x
-            imu_data[4] / self.IMU_SCALES['gyro'],  # gyr_y
-            imu_data[5] / self.IMU_SCALES['gyro']   # gyr_z
+            val_x / self.IMU_SCALES['accel'], # acl_x
+            val_y / self.IMU_SCALES['accel'], # acl_y
+            val_z / self.IMU_SCALES['accel'], # acl_z
+            gyro_x / self.IMU_SCALES['gyro'],  # gyr_x
+            gyro_y / self.IMU_SCALES['gyro'],  # gyr_y
+            gyro_z / self.IMU_SCALES['gyro']   # gyr_z
         ], dtype=np.float32)
         return normalized
 

@@ -90,6 +90,7 @@ DRONE_YAW_PWM_CAP = 150
 # CH3 with nothing to cancel, and the drone descends on every yaw input.
 # Keep this 0 while in Acro; retune separately if you go back to Angle.
 DRONE_YAW_THROTTLE_FEEDFORWARD = -50.0
+DRONE_PITCH_THROTTLE_FEEDFORWARD = 0.0
 
 # ---- Altitude Hold (Vertical Velocity Damper) ----
 # Proportional gain (PWM per m/s): -k_pwm * vz added to throttle when

@@ -47,8 +47,9 @@ class TorchPilot:
         arr = np.asarray(img_arr, dtype=np.float32) / 255.0
         # HWC → CHW, add batch dim
         tensor = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
+        # Swapping acl_x/y and gyr_x/y to match the dataset's coordinate correction
         imu_sample = np.array(
-            [acl_x / 10.0, acl_y / 10.0, acl_z / 10.0, gyr_x / 5.0, gyr_y / 5.0, gyr_z / 5.0],
+            [acl_y / 10.0, acl_x / 10.0, acl_z / 10.0, gyr_y / 5.0, gyr_x / 5.0, gyr_z / 5.0],
             dtype=np.float32,
         )
         self._imu_history = np.roll(self._imu_history, shift=-1, axis=0)

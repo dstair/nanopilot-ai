@@ -63,6 +63,7 @@ DRONE_MAX_YAW_RATE = 120.0
 
 DRONE_ANGLE_MODE=True # this appears to always set to Acro mode regardless of True/FLse
 DRONE_YAW_THROTTLE_FEEDFORWARD = 0.0
+DRONE_PITCH_THROTTLE_FEEDFORWARD = 8.0
 
 # Input sensitivity multiplier [0.0–1.0]: scales stick deflection sent to
 # BetaFlight. 1.0 = full deflection (±500 PWM from center on pitch/yaw);

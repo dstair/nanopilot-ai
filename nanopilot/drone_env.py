@@ -68,6 +68,7 @@ def build_drone_env(
         input_sensitivity=getattr(cfg, "DRONE_INPUT_SENSITIVITY", 1.0),
         yaw_pwm_cap=getattr(cfg, "DRONE_YAW_PWM_CAP", None),
         yaw_throttle_feedforward=getattr(cfg, "DRONE_YAW_THROTTLE_FEEDFORWARD", 0.0),
+        pitch_throttle_feedforward=getattr(cfg, "DRONE_PITCH_THROTTLE_FEEDFORWARD", 0.0),
         altitude_hold_k=getattr(cfg, "DRONE_ALTITUDE_HOLD_K", 30.0),
         altitude_hold_deadband=getattr(cfg, "DRONE_ALTITUDE_HOLD_DEADBAND", 0.05),
         altitude_hold_enabled=getattr(cfg, "DRONE_ALTITUDE_HOLD_ENABLED", True),

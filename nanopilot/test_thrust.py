@@ -968,7 +968,8 @@ def run_inflight_hover_sweep(
 def run_damper_sim_test(
     rc_sock, hover_pwm=1490, k_pwm=30.0, climb_pwm=1600, climb_s=3.0,
     sample_s=8.0, dt=0.05, deadband=0.05, pitch_pwm=1500, pitch_after_s=None,
-    yaw_pwm=1500, yaw_after_s=None, yaw_ff=0.0, yaw_pwm_cap=30,
+    pitch_ff=0.0, pitch_pwm_cap=200, yaw_pwm=1500, yaw_after_s=None,
+    yaw_ff=0.0, yaw_pwm_cap=30,
 ):
     """Emulate drone_gym.py's _PoseTracker damper directly.
 
@@ -1029,7 +1030,14 @@ def run_damper_sim_test(
             if yaw_ff > 0 and steer_eq > 0.01:
                 yaw_ff_bias = -yaw_ff
             yaw_ff_bias = max(-200.0, min(0.0, yaw_ff_bias))
-            ch3 = int(max(1000, min(2000, hover_pwm + bias + yaw_ff_bias)))
+            cur_pitch_for_ff = (
+                pitch_pwm if (pitch_after_s is not None and (now - t_start) >= pitch_after_s)
+                else 1500
+            )
+            pitch_eq = abs(cur_pitch_for_ff - 1500) / max(1, pitch_pwm_cap)
+            pitch_eq = min(1.0, pitch_eq)
+            pitch_ff_bias = max(0.0, min(200.0, pitch_ff * pitch_eq))
+            ch3 = int(max(1000, min(2000, hover_pwm + bias + yaw_ff_bias + pitch_ff_bias)))
             att = query_attitude_deg()
             yaw_deg = att[2] if att else None
             samples.append((now - t_start, z, vz, ch3, yaw_deg))
@@ -1146,6 +1154,18 @@ def main():
         type=float,
         default=None,
         help="Seconds into damper-sim after which pitch is applied (default: never).",
+    )
+    parser.add_argument(
+        "--damper-pitch-ff",
+        type=float,
+        default=0.0,
+        help="Pitch→throttle feed-forward PWM at full runtime pitch input. 0 = off.",
+    )
+    parser.add_argument(
+        "--damper-pitch-cap",
+        type=int,
+        default=200,
+        help="Runtime pitch PWM deflection at full input, e.g. 200 for sensitivity 0.4.",
     )
     parser.add_argument(
         "--damper-sample-s",
@@ -1297,6 +1317,8 @@ def main():
             sample_s=args.damper_sample_s,
             pitch_pwm=args.damper_pitch_pwm,
             pitch_after_s=args.damper_pitch_after,
+            pitch_ff=args.damper_pitch_ff,
+            pitch_pwm_cap=args.damper_pitch_cap,
             yaw_pwm=args.damper_yaw_pwm,
             yaw_after_s=args.damper_yaw_after,
             yaw_ff=args.damper_yaw_ff,

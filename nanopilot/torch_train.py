@@ -95,8 +95,10 @@ def train(
     if n_train == 0 or n_val == 0:
         print("ERROR: Need at least two samples for a train/val split.")
         return
-    split_generator = torch.Generator().manual_seed(42)
-    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=split_generator)
+    # Chronological Split: Train on the start of the logs, validate on the end.
+    # This prevents temporal data leakage between adjacent frames.
+    train_ds = Subset(dataset, range(0, n_train))
+    val_ds = Subset(dataset, range(n_train, n_train + n_val))
     print(f"Train: {n_train}, Val: {n_val}")
 
     pin = device.type == 'cuda'

@@ -1302,3 +1302,50 @@ uv run --env-file .env python nanopilot/torch_train.py \
 Notes:
 - First collector attempt subscribed to stale/default `/world/drone_course_80mm/...` while the running default world was `baylands_80mm`; setting `GZ_WORLD=baylands_80mm` fixed the topic.
 - 720p recording/downsample remains a separate follow-up. The current model can resize before training, but Gazebo render cost and JPEG I/O/storage should be measured separately.
+
+## Current Handoff (2026-05-17 horizontal damping)
+
+Applied the README TODO to increase horizontal damping from `0.25` to `0.35` for both external Gazebo airframes:
+- `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_65mm/model.sdf`
+- `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`
+
+Both files now set:
+- `base_link` `<velocity_decay><linear>0.35</linear>`
+- BetaflightPlugin `<horizontalVelocityDecay>0.35</horizontalVelocityDecay>`
+
+Angular damping was left unchanged at `0.50`.
+
+## Current Handoff (2026-05-17 pitch altitude compensation)
+
+Investigated 80mm altitude loss during forward flight with pitch applied and neutral altitude.
+
+Reproduction with no pitch feed-forward:
+```bash
+./scripts/test_thrust.sh --airframe=80mm --mode=damper-sim \
+  --airborne-hover=1475 --airborne-climb=1500 --airborne-climb-s=1.0 \
+  --damper-k=45 --damper-sample-s=8 \
+  --damper-pitch-after=3 --damper-pitch-pwm=1700
+```
+- After pitch started, altitude dropped from about `1.11m` to ground contact around `0.50m`.
+- Summary: after-settle drift `-0.546m`, `vz_mean=-0.074m/s`, failed the damper check.
+
+Baseline with no pitch input still passed but was near the edge:
+- after-settle drift `-0.423m`, `vz_mean=-0.058m/s`.
+
+Fix:
+- Added `DRONE_PITCH_THROTTLE_FEEDFORWARD`, passed from config through `drone_env.py` into `DroneGymEnv`.
+- Runtime applies it only when altitude input is in the neutral/deadband region, proportional to `abs(throttle)` (pitch command), so it does not fight deliberate climb/descend commands.
+- Added matching `test_thrust.py --damper-pitch-ff` and `--damper-pitch-cap` knobs for validation.
+- Tuned 80mm to `DRONE_PITCH_THROTTLE_FEEDFORWARD = 8.0`.
+- Left 65mm at `0.0` until separately validated.
+
+Validation:
+```bash
+./scripts/test_thrust.sh --airframe=80mm --mode=damper-sim \
+  --airborne-hover=1475 --airborne-climb=1500 --airborne-climb-s=1.0 \
+  --damper-k=45 --damper-sample-s=8 \
+  --damper-pitch-after=3 --damper-pitch-pwm=1700 \
+  --damper-pitch-ff=8 --damper-pitch-cap=200
+```
+- Passed: after-settle drift `-0.106m`, `alt_p2p=0.130m`, `vz_mean=-0.013m/s`, `ch3_mean=1481.0`.
+- Trial value `25` was too high and caused a strong climb, so keep `8.0` unless retuning for a different pitch sensitivity or airframe.

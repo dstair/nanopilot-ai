@@ -90,6 +90,7 @@ class DroneGymEnv:
         input_sensitivity=1.0,
         yaw_pwm_cap=None,
         yaw_throttle_feedforward=0.0,
+        pitch_throttle_feedforward=0.0,
         altitude_hold_k=30.0,
         altitude_hold_deadband=0.05,
         altitude_hold_enabled=True,
@@ -139,6 +140,9 @@ class DroneGymEnv:
         # via motor-mixer ω² asymmetry. Subtract this many PWM from CH3 at
         # |steer|=1 (linear in |steer|). Tune via test_thrust damper-sim.
         self.yaw_throttle_feedforward = float(max(0.0, yaw_throttle_feedforward))
+        # Pitch tilt reduces vertical thrust when altitude is neutral. Add
+        # this many PWM at |pitch input|=1 to compensate forward/back flight.
+        self.pitch_throttle_feedforward = float(max(0.0, pitch_throttle_feedforward))
         self.record_position = record_position
         self.record_attitude = record_attitude
         self.record_velocity = record_velocity
@@ -376,6 +380,11 @@ class DroneGymEnv:
             yaw_ff_bias = -int(self.yaw_throttle_feedforward)
         yaw_ff_bias = max(-200, min(0, yaw_ff_bias))
 
+        pitch_ff_bias = 0
+        if self.pitch_throttle_feedforward > 0 and abs(alt) < self.altitude_hold_deadband:
+            pitch_ff_bias = int(self.pitch_throttle_feedforward * abs(self.throttle))
+        pitch_ff_bias = max(0, min(200, pitch_ff_bias))
+
         throttle_pwm = int(
             max(
                 1000,
@@ -384,7 +393,8 @@ class DroneGymEnv:
                     self.hover_throttle
                     + alt_scaled * self.throttle_range
                     + alt_hold_bias
-                    + yaw_ff_bias,
+                    + yaw_ff_bias
+                    + pitch_ff_bias,
                 ),
             )
         )
