@@ -1,12 +1,12 @@
 [project]
-name = "mycar"
+name = "nanopilot-ai"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
     "albumentations>=2.0.8",
-    "donkeycar @ git+https://github.com/dstair/donkeycar.git@feature/donkeydrone",
+    "donkeycar @ git+https://github.com/dstair/donkeycar.git@ca0b489b2c3292f3b70f32204054f174eb73945c",
     "opencv-python-headless>=4.13.0.92",
     "protobuf>=7.34.1",
     "pygame>=2.6.1",

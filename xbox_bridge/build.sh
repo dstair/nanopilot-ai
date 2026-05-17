@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build XboxBridge.app — a real .app bundle that reads Xbox controller state
-# via Apple's GameController framework and forwards to /tmp/donkeydrone_xbox.sock.
+# via Apple's GameController framework and forwards to /tmp/nanopilot_xbox.sock.
 #
 # Required because Apple's XboxGamepad dext claims exclusive HID ownership;
 # only GameController.framework (in a real bundle) can read inputs.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Headless scripted data collection for DonkeyDrone.
+Headless scripted data collection for Nanopilot.
 
 Requires BetaFlight SITL + Gazebo to already be running, for example via:
     ./scripts/start.sh --no-manage --airframe=65mm
@@ -168,7 +168,7 @@ def collect(cfg, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect scripted DonkeyDrone tub data")
+    parser = argparse.ArgumentParser(description="Collect scripted Nanopilot tub data")
     parser.add_argument("--airframe", choices=["65mm", "80mm"], default="65mm")
     parser.add_argument("--myconfig", default=None)
     parser.add_argument("--duration", type=float, default=30.0)

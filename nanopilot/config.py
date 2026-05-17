@@ -7,7 +7,7 @@ performance.
 EXAMPLE
 -----------
 import dk
-cfg = dk.load_config(config_path='~/mycar/config.py')
+cfg = dk.load_config(config_path='~/nanopilot-ai/config.py')
 print(cfg.CAMERA_RESOLUTION)
 
 """
@@ -39,7 +39,7 @@ BGR2RGB = False  # true to convert from BRG format to RGB format; requires openc
 SHOW_PILOT_IMAGE = False  # show the image used to do the inference when in autopilot mode
 
 # For IMAGE_LIST camera
-# PATH_MASK = "~/mycar/data/tub_1_20-03-12/*.jpg"
+# PATH_MASK = "~/nanopilot-ai/data/tub_1_20-03-12/*.jpg"
 
 #9865, over rides only if needed, ie. TX2..
 PCA9685_I2C_ADDR = 0x40     #I2C address, use i2cdetect to validate this number
@@ -438,9 +438,9 @@ PRUNE_EVAL_PERCENT_OF_DATASET = .05  # percent of dataset used to perform evalua
 #     the absolute file path to the python file that has the transformer
 #     class.  For instance, if you called the file
 #     `my_custom_transformer.py` and put in in the root of
-#     your `mycar` folder, next to `myconfig.py`, then you would add 
+#     your `nanopilot-ai` folder, next to `myconfig.py`, then you would add
 #     the following to your myconfig.py file (keeping with the crop example);
-#     `CUSTOM_CROP_MODULE = "/home/pi/mycar/my_custom_transformer.py"`
+#     `CUSTOM_CROP_MODULE = "/home/pi/nanopilot-ai/my_custom_transformer.py"`
 #     The actual path will depend on what OS you are using and what
 #     your user name is.
 #   - The class config will begin with the transformer label and end with `_CLASS`,

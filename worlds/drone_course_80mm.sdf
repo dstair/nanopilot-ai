@@ -2,7 +2,7 @@
 <!--
   drone_course world — a colorful corridor course for CNN-based drone training.
 
-  Designed for DonkeyDrone: the drone flies at ~3m altitude through a walled
+  Designed for Nanopilot: the drone flies at ~3m altitude through a walled
   course with high-contrast colored surfaces.  The CNN learns to steer (yaw)
   and control speed (forward velocity) from camera images, so every wall and
   the ground must be visually distinct.

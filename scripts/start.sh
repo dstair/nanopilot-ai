@@ -74,7 +74,7 @@ BETAFLIGHT_BIN="${BETAFLIGHT_SITL_BIN:-$HOME/dev/betaflight/obj/main/betaflight_
 # ── Cleanup on exit ──────────────────────────────────────────────
 stop_xbox_bridge() {
     pkill -f "XboxBridge.app|Contents/MacOS/XboxBridge" 2>/dev/null || true
-    rm -f /tmp/donkeydrone_xbox.sock 2>/dev/null || true
+    rm -f /tmp/nanopilot_xbox.sock 2>/dev/null || true
 }
 
 cleanup() {
@@ -94,7 +94,7 @@ mkdir -p "$LOG_DIR"
 
 EXISTING_STACK="$(pgrep -fl 'betaflight_SITL|gz sim|ruby.*gz|gz_camera_worker.py|drone_manage.py drive' || true)"
 if [ -n "$EXISTING_STACK" ]; then
-    echo "ERROR: existing DonkeyDrone sim processes are still running:" >&2
+    echo "ERROR: existing Nanopilot sim processes are still running:" >&2
     echo "$EXISTING_STACK" >&2
     echo "Run: bash $SCRIPT_DIR/stop_all.sh" >&2
     exit 1
@@ -462,7 +462,7 @@ else
     # GameController.framework is the only macOS path that sees an Xbox
     # controller (Apple's XboxGamepad dext blocks pygame/SDL/hidapi), and it
     # only works from a real .app bundle. The bridge sends controller frames at
-    # 60Hz to /tmp/donkeydrone_xbox.sock; XboxDroneController binds it.
+    # 60Hz to /tmp/nanopilot_xbox.sock; XboxDroneController binds it.
     if [ "$USE_XBOX" = "1" ]; then
         XBOX_APP="$PROJECT_DIR/xbox_bridge/build/XboxBridge.app"
         XBOX_BIN="$XBOX_APP/Contents/MacOS/XboxBridge"
@@ -478,11 +478,11 @@ else
         # Kill any prior instance so it re-enumerates the controller cleanly.
         stop_xbox_bridge
         sleep 0.3
-        echo "Starting XboxBridge.app (controller → UDS @ /tmp/donkeydrone_xbox.sock)..."
+        echo "Starting XboxBridge.app (controller → UDS @ /tmp/nanopilot_xbox.sock)..."
         open "$XBOX_APP"
     fi
 
     echo "Starting drone_manage.py (--myconfig=$DRONE_CONFIG)..."
     uv run --env-file .env python -W ignore::SyntaxWarning \
-        donkeydrone/drone_manage.py drive --myconfig="$DRONE_CONFIG" ${MANAGE_ARGS[@]+"${MANAGE_ARGS[@]}"}
+        nanopilot/drone_manage.py drive --myconfig="$DRONE_CONFIG" ${MANAGE_ARGS[@]+"${MANAGE_ARGS[@]}"}
 fi

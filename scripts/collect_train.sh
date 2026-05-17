@@ -89,7 +89,7 @@ done
 
 echo "Collecting scripted flight data..."
 cd "$PROJECT_DIR"
-uv run --env-file .env python donkeydrone/autonomous_collect.py \
+uv run --env-file .env python nanopilot/autonomous_collect.py \
     "--airframe=$AIRFRAME" \
     "--duration=$DURATION" \
     "--warmup=$WARMUP" \
@@ -112,7 +112,7 @@ if [ -n "$MAX_EPOCHS" ]; then
     TRAIN_ARGS+=("--max-epochs=$MAX_EPOCHS")
 fi
 
-uv run --env-file .env python donkeydrone/torch_train.py "${TRAIN_ARGS[@]}" | tee "$TRAIN_LOG"
+uv run --env-file .env python nanopilot/torch_train.py "${TRAIN_ARGS[@]}" | tee "$TRAIN_LOG"
 
 echo "Collected tub: $TUB_PATH"
 echo "Model: $MODEL_PATH"

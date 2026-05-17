@@ -110,7 +110,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/a2/55/8f8cab2afd404cf57
 [[package]]
 name = "donkeycar"
 version = "5.2.dev6"
-source = { git = "https://github.com/dstair/donkeycar.git?rev=feature%2Fdonkeydrone#ca0b489b2c3292f3b70f32204054f174eb73945c" }
+source = { git = "https://github.com/dstair/donkeycar.git?rev=ca0b489b2c3292f3b70f32204054f174eb73945c#ca0b489b2c3292f3b70f32204054f174eb73945c" }
 dependencies = [
     { name = "docopt" },
     { name = "numpy" },
@@ -198,7 +198,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mycar"
+name = "nanopilot-ai"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
@@ -215,7 +215,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "albumentations", specifier = ">=2.0.8" },
-    { name = "donkeycar", git = "https://github.com/dstair/donkeycar.git?rev=feature%2Fdonkeydrone" },
+    { name = "donkeycar", git = "https://github.com/dstair/donkeycar.git?rev=ca0b489b2c3292f3b70f32204054f174eb73945c" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "protobuf", specifier = ">=7.34.1" },
     { name = "pygame", specifier = ">=2.6.1" },

@@ -1,4 +1,4 @@
-"""Shared tub schema constants for DonkeyDrone data."""
+"""Shared tub schema constants for Nanopilot data."""
 
 BASE_TUB_INPUTS = [
     "cam/image_array",

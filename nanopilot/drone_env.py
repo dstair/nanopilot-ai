@@ -16,7 +16,7 @@ def build_drone_env(
     gz_world=None,
     gz_model_name=None,
 ):
-    """Build DroneGymEnv from DonkeyDrone config with optional overrides."""
+    """Build DroneGymEnv from Nanopilot config with optional overrides."""
     if airframe is not None:
         gz_world = gz_world or os.environ.get("GZ_WORLD", f"drone_course_{airframe}")
         gz_model_name = gz_model_name or f"betaloop_drone_cam_{airframe}"

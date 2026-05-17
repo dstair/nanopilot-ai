@@ -1,7 +1,7 @@
 """
 Smoke test for XboxBridge.app standalone.
 
-Binds /tmp/donkeydrone_xbox.sock, launches XboxBridge.app, prints a frame
+Binds /tmp/nanopilot_xbox.sock, launches XboxBridge.app, prints a frame
 every 0.5s for ~10s. Verifies that GameController.framework actually
 delivers Xbox controller state to a real .app bundle on this Mac.
 
@@ -14,7 +14,7 @@ import struct
 import subprocess
 import time
 
-SOCK = "/tmp/donkeydrone_xbox.sock"
+SOCK = "/tmp/nanopilot_xbox.sock"
 APP = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                    "build", "XboxBridge.app")
 FMT = "<fffffBB"

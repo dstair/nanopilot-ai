@@ -254,7 +254,7 @@ var driveHandler = new function() {
     }
 
     var applyDroneTheme = function() {
-      if ($('#donkeydrone-theme').length) return;
+      if ($('#nanopilot-theme').length) return;
       var css = ''
         + 'html, body { background:#000 !important; color:#eee !important; }'
         + '.container, .container-fluid, .row, #content, #main, #drive, #control-bars {'
@@ -307,7 +307,7 @@ var driveHandler = new function() {
         +   '.rc-status { width:100%; }'
         +   '.rc-meta, .rc-sticks, .rc-values { grid-template-columns:1fr; }'
         + '}';
-      $('head').append('<style id="donkeydrone-theme">' + css + '</style>');
+      $('head').append('<style id="nanopilot-theme">' + css + '</style>');
     };
 
     var injectRcPanel = function() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate DonkeyDrone PyTorch models against recorded tubs."""
+"""Evaluate Nanopilot PyTorch models against recorded tubs."""
 
 import argparse
 import json
@@ -16,7 +16,7 @@ from torch_model import LinearModel, ResidualBlock
 
 AXES = ("Yaw", "Pitch", "Roll", "Altitude")
 DEFAULT_BENCHMARK_TUBS = ("data/tub_209_26-05-09",)
-BENCHMARK_ENV = "DONKEYDRONE_BENCHMARK_TUBS"
+BENCHMARK_ENV = "NANOPILOT_BENCHMARK_TUBS"
 
 
 class LegacyImuFcLinearModel(torch.nn.Module):
@@ -281,7 +281,7 @@ def print_comparison(old_metrics, new_metrics, weights):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate DonkeyDrone .pth models")
+    parser = argparse.ArgumentParser(description="Evaluate Nanopilot .pth models")
     parser.add_argument(
         "--tubs",
         help=(

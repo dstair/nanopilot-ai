@@ -8,7 +8,7 @@ claims exclusive HID ownership of Xbox controllers on modern macOS, which
 prevents pygame/SDL/hidapi from seeing inputs. The only supported path is
 GameController.framework from a real .app bundle. `xbox_bridge/main.swift`
 is that bundle; it sends controller frames at 60Hz to
-/tmp/donkeydrone_xbox.sock and this part binds the receiving end.
+/tmp/nanopilot_xbox.sock and this part binds the receiving end.
 
 Frame format (26 bytes, little-endian, matches xbox_bridge/main.swift):
     float32 leftX, float32 leftY, float32 rightX, float32 rightY,
@@ -43,7 +43,7 @@ import struct
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SOCK_PATH = os.environ.get(
-    "DONKEYDRONE_XBOX_SOCK", "/tmp/donkeydrone_xbox.sock"
+    "NANOPILOT_XBOX_SOCK", "/tmp/nanopilot_xbox.sock"
 )
 _FRAME_FMT = "<ffffffBB"
 _FRAME_SIZE = struct.calcsize(_FRAME_FMT)

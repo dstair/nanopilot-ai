@@ -14,7 +14,7 @@
 // LT (leftTrigger) is a reset button: on rising edge past 0.5, the drone
 // teleports back to its spawn position.
 //
-// Socket path: $DONKEYDRONE_XBOX_SOCK or /tmp/donkeydrone_xbox.sock
+// Socket path: $NANOPILOT_XBOX_SOCK or /tmp/nanopilot_xbox.sock
 //
 // Logs go to NSLog (visible via `log stream --process XboxBridge`).
 // FileHandle.standardError writes are dropped for .app launched via `open`.
@@ -24,10 +24,10 @@ import GameController
 import Darwin
 import os
 
-let SOCK_PATH = ProcessInfo.processInfo.environment["DONKEYDRONE_XBOX_SOCK"]
-    ?? "/tmp/donkeydrone_xbox.sock"
+let SOCK_PATH = ProcessInfo.processInfo.environment["NANOPILOT_XBOX_SOCK"]
+    ?? "/tmp/nanopilot_xbox.sock"
 
-let osLogger = OSLog(subsystem: "com.donkeydrone.xboxbridge", category: "bridge")
+let osLogger = OSLog(subsystem: "com.nanopilot.xboxbridge", category: "bridge")
 
 func logLine(_ s: String) {
     // Use public format so the message isn't redacted in `log stream`.

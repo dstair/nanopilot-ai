@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic script for DonkeyDrone BetaFlight SITL + Gazebo integration.
+Diagnostic script for Nanopilot BetaFlight SITL + Gazebo integration.
 
 Run this WHILE the system is running (after ./scripts/start.sh or manually):
     python3 scripts/diagnose.py
@@ -208,7 +208,7 @@ def check_motor_mapping():
 
 def main():
     print("=" * 60)
-    print("DonkeyDrone BetaFlight SITL Diagnostic")
+    print("Nanopilot BetaFlight SITL Diagnostic")
     print("=" * 60)
 
     # Connect to BetaFlight MSP

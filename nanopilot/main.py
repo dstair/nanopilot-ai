@@ -1,5 +1,5 @@
 def main():
-    print("Hello from mycar!")
+    print("Hello from nanopilot-ai!")
 
 
 if __name__ == "__main__":

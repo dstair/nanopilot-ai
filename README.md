@@ -1,4 +1,4 @@
-# DonkeyDrone: CNN-Based Autonomous Drone Flight
+# Nanopilot: CNN-Based Autonomous Drone Flight
 
 Fly a drone using the same workflow as DonkeyCar:
 
@@ -26,7 +26,7 @@ Camera frames  <--  DroneGymEnv  <--  Gazebo
  (320x240 RGB)      (gz-transport)    (renders scene)
 ```
 
-Camera mode (set `DRONE_CAMERA_SOURCE` in your `donkeydrone/drone_config_XXmm.py`):
+Camera mode (set `DRONE_CAMERA_SOURCE` in your `nanopilot/drone_config_XXmm.py`):
 - **`gz_transport`** (default) — native macOS: Gazebo Harmonic publishes images
   on a gz-transport topic. GPU-accelerated via Metal/OpenGL. Requires `gz-python`.
 
@@ -105,7 +105,7 @@ to point to the install location.
 ### Step 4: Install Python dependencies
 
 ```bash
-cd ~/dev/DonkeyDrone
+cd ~/dev/nanopilot-ai
 uv sync
 ```
 
@@ -124,10 +124,10 @@ Verify the bindings are importable:
 uv run --env-file .env python -c "import gz.transport13; print('OK')"
 ```
 
-### Run DonkeyDrone
+### Run Nanopilot
 
 `scripts/start.sh` launches Gazebo and BetaFlight SITL in the background, waits
-for readiness, then runs `donkeydrone/drone_manage.py` in the foreground. Ctrl+C
+for readiness, then runs `nanopilot/drone_manage.py` in the foreground. Ctrl+C
 stops everything.
 
 ```bash
@@ -144,7 +144,7 @@ Then open http://127.0.0.1:8887
 1. Launches Gazebo with the selected world
 2. Waits for the camera topic to appear
 3. Launches BetaFlight SITL
-4. Runs `donkeydrone/drone_manage.py` which starts the Web UI and sends RC packets
+4. Runs `nanopilot/drone_manage.py` which starts the Web UI and sends RC packets
 5. On exit or Ctrl+C, calls `scripts/stop_all.sh` to kill all processes cleanly
 
 **Environment variables** for customization:
@@ -174,7 +174,7 @@ bash ./scripts/stop_all.sh
 Once you have flown the drone for a bit, there will be a new "tub" in the `data/` folder. You can then use that data to train a CNN. Note, this could take a while. A "hello world" test on 300 images took 5 minutes on an M1 Mac:
 
 ```bash
-uv run python donkeydrone/torch_train.py --tubs=data/tub_[number]_[yy-mm-dd] --model=models/pilot.pth
+uv run python nanopilot/torch_train.py --tubs=data/tub_[number]_[yy-mm-dd] --model=models/pilot.pth
 ```
 
 Once training completes, note the model output: models/pilot.pth. It is needed for next step.
@@ -197,7 +197,7 @@ In the Web UI, switch to "local_angle" or "local" mode.
 
 ## Configuration
 
-Two airframe configs are maintained side-by-side. Pick one with `--airframe=65mm|80mm` on `start.sh` (default `80mm`, the Pavo Pico II). Edit the matching `donkeydrone/drone_config_XXmm.py` to adjust parameters:
+Two airframe configs are maintained side-by-side. Pick one with `--airframe=65mm|80mm` on `start.sh` (default `80mm`, the Pavo Pico II). Edit the matching `nanopilot/drone_config_XXmm.py` to adjust parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -247,14 +247,14 @@ macOS Host (Apple Silicon, ARM64)
 |------|---------|
 | `scripts/start.sh`        | Single-command launcher: starts Gazebo + BetaFlight SITL, runs drone_manage, cleans up on exit |
 | `scripts/stop_all.sh`     | Kills all BetaFlight/Gazebo processes |
-| `donkeydrone/drone_manage.py` | Main entry point (replaces `manage.py` for drone use) |
-| `donkeydrone/drone_gym.py`    | DroneGymEnv part: BetaFlight RC UDP + gz-transport camera bridge |
-| `donkeydrone/drone_config_80mm.py` | Pavo Pico II 80mm, 79g AUW config (default airframe) |
-| `donkeydrone/drone_config_65mm.py` | BetaFPV Air65 config (alternate airframe) |
-| `donkeydrone/config.py`       | Base DonkeyCar config (shared, not modified) |
-| `donkeydrone/torch_model.py`  | CNN architecture (LinearModel, PyTorch) |
-| `donkeydrone/torch_pilot.py`  | Inference wrapper for vehicle loop |
-| `donkeydrone/torch_train.py`  | Training script |
+| `nanopilot/drone_manage.py` | Main entry point (replaces `manage.py` for drone use) |
+| `nanopilot/drone_gym.py`    | DroneGymEnv part: BetaFlight RC UDP + gz-transport camera bridge |
+| `nanopilot/drone_config_80mm.py` | Pavo Pico II 80mm, 79g AUW config (default airframe) |
+| `nanopilot/drone_config_65mm.py` | BetaFPV Air65 config (alternate airframe) |
+| `nanopilot/config.py`       | Base DonkeyCar config (shared, not modified) |
+| `nanopilot/torch_model.py`  | CNN architecture (LinearModel, PyTorch) |
+| `nanopilot/torch_pilot.py`  | Inference wrapper for vehicle loop |
+| `nanopilot/torch_train.py`  | Training script |
 | `worlds/drone_course_65mm.sdf` | 65mm Air65 world (colored walls + Air65 model) |
 | `worlds/drone_course_80mm.sdf` | 80mm Pavo Pico II world (same course, 80mm model) |
 | `worlds/baylands_80mm.sdf` | Default 80mm Baylands world |
@@ -297,7 +297,7 @@ importable.
 **Camera topic not found / blank frames**: Run
 `PATH=/opt/homebrew/opt/ruby/bin:$PATH gz topic -l | grep camera` while Gazebo
 is running to confirm the exact topic name. Update `DRONE_GZ_CAMERA_TOPIC` in
-`donkeydrone/drone_config.py` if the model index differs (e.g., `_1` instead of `_0`).
+`nanopilot/drone_config.py` if the model index differs (e.g., `_1` instead of `_0`).
 
 **`gz sim` fails to load plugins / "incompatible architecture"**: The `gz` Ruby
 wrapper must run under ARM64 Ruby. Ensure
@@ -338,7 +338,7 @@ Trade-offs by resolution:
 | Resolution | Pixels | Training cost | Notes |
 |------------|--------|---------------|-------|
 | 160x120 | 19K | Baseline | DonkeyCar car default |
-| 320x240 | 77K | Lower I/O | Previous DonkeyDrone default |
+| 320x240 | 77K | Lower I/O | Previous Nanopilot default |
 | 640x480 | 307K | Moderate I/O | Current Gazebo sensor native |
 | 1280x720 | 922K | Heavy I/O/render | Useful for review/future data |
 
@@ -390,7 +390,7 @@ X worlds - all 80 mm
 
 X clean up the UI. Want to show pitch, roll, yaw, and throttle.
   X add status indicator, i.e. ARMED
-X black background for donkeydrone UI
+X black background for nanopilot UI
 
 X Address vertical climb issue.
 X fix skating rink effect.
@@ -408,7 +408,6 @@ X 640x480
 - Add randomization of worlds (wall locations, colors) for better CNN training
 - Add looping to train model on a variety of worlds
 - research other tasks that would be interesting to implement (CNN to scan/build a 3D model of an object, for example)
-
 
 
 

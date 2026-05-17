@@ -46,6 +46,7 @@ _GZ_CAMERA_TOPIC_DEFAULT = (
     "/world/drone_course_65mm/model/betaloop_drone_cam_65mm"
     "/link/camera_link/sensor/camera/image"
 )
+_YAW_DEG_PER_SEC_PER_PWM = 0.30
 
 
 class DroneGymEnv:
@@ -87,7 +88,7 @@ class DroneGymEnv:
         measure_loop_delay=False,
         loop_delay_log_interval=100,
         input_sensitivity=1.0,
-        yaw_pwm_cap=30,
+        yaw_pwm_cap=None,
         yaw_throttle_feedforward=0.0,
         altitude_hold_k=30.0,
         altitude_hold_deadband=0.05,
@@ -111,7 +112,7 @@ class DroneGymEnv:
         self.max_roll_angle = (
             self.max_pitch_angle if max_roll_angle is None else float(max_roll_angle)
         )
-        self.max_yaw_rate = max_yaw_rate
+        self.max_yaw_rate = float(max_yaw_rate)
         self.hover_throttle = hover_throttle
         self.throttle_range = throttle_range
         self.throttle_scale = float(max(0.1, throttle_scale))
@@ -128,10 +129,12 @@ class DroneGymEnv:
         self.altitude_hold_enabled = bool(altitude_hold_enabled)
         self.angle_mode = bool(angle_mode)
         # Max CH4 (yaw) deflection in PWM microseconds from center (1500).
-        # The motor mixer's ω²-asymmetry means yaw input at hover produces net
-        # upward thrust — full ±500 deflection makes the drone rocket up. Cap
-        # yaw small to keep the climb induced by turning manageable.
-        self.yaw_pwm_cap = int(max(0, min(500, yaw_pwm_cap)))
+        # When no explicit PWM cap is provided, derive it from the desired yaw
+        # rate using the 80mm sim measurement: CH4 +/-293us produced ~87 deg/s.
+        # The value is clamped to BF's full stick range.
+        if yaw_pwm_cap is None:
+            yaw_pwm_cap = self.max_yaw_rate / _YAW_DEG_PER_SEC_PER_PWM
+        self.yaw_pwm_cap = int(max(0, min(500, round(yaw_pwm_cap))))
         # Yaw-induced thrust feed-forward: yaw input creates net upward thrust
         # via motor-mixer ω² asymmetry. Subtract this many PWM from CH3 at
         # |steer|=1 (linear in |steer|). Tune via test_thrust damper-sim.

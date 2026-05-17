@@ -4,7 +4,7 @@ This file provides guidance to coding agents working in this repository. Start h
 
 ## Project Summary
 
-DonkeyDrone adapts the DonkeyCar pipeline to fly a simulated quadrotor drone using a CNN trained from camera images. Workflow: manually fly → record data → train CNN → fly autonomously. Runs on BetaFlight SITL + Gazebo Harmonic, native Apple Silicon (ARM64).
+Nanopilot adapts the DonkeyCar pipeline to fly a simulated quadrotor drone using a CNN trained from camera images. Workflow: manually fly → record data → train CNN → fly autonomously. Runs on BetaFlight SITL + Gazebo Harmonic, native Apple Silicon (ARM64).
 
 **Semantic mapping** (identical key names to DonkeyCar, BetaFlight Angle mode):
 - `steering [-1, 1]` = yaw rate
@@ -27,7 +27,7 @@ uv sync
 ./scripts/start.sh --model=models/pilot.pth
 
 # Run without start.sh (BetaFlight SITL + Gazebo must already be running)
-uv run --env-file .env python -W ignore::SyntaxWarning donkeydrone/drone_manage.py drive --myconfig=drone_config_65mm.py
+uv run --env-file .env python -W ignore::SyntaxWarning nanopilot/drone_manage.py drive --myconfig=drone_config_65mm.py
 
 # Bring up the sim stack only (no drone_manage) — useful for tools that talk to
 # BetaFlight's RC port directly, like test_thrust.py
@@ -40,13 +40,13 @@ uv run --env-file .env python -W ignore::SyntaxWarning donkeydrone/drone_manage.
 ./scripts/collect_train.sh --airframe=65mm --duration=30 --max-epochs=5 --model=models/scripted_autonomous.pth
 
 # Train CNN (full/default run; can take a while)
-uv run --env-file .env python donkeydrone/torch_train.py --tubs=data/tub_NN_YY-MM-DD --model=models/pilot.pth
+uv run --env-file .env python nanopilot/torch_train.py --tubs=data/tub_NN_YY-MM-DD --model=models/pilot.pth
 
 # Multiple tubs (comma-separated)
-uv run --env-file .env python donkeydrone/torch_train.py --tubs=data/tub_1_26-03-01,data/tub_2_26-03-01 --model=models/pilot.pth
+uv run --env-file .env python nanopilot/torch_train.py --tubs=data/tub_1_26-03-01,data/tub_2_26-03-01 --model=models/pilot.pth
 
 # Bounded hello-world training run (known to finish quickly on Apple Silicon)
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_3_26-05-09 \
   --model=models/hello_world_tub3.pth \
   --max-epochs=1 \
@@ -55,12 +55,12 @@ uv run --env-file .env python donkeydrone/torch_train.py \
   --no-model-summary
 
 # Evaluate one model on a held-out tub
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_4_26-05-09 \
   --model=models/hello_world_tub3.pth
 
 # Compare two models; if --tubs is omitted, evaluate.py uses its default benchmark tub
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --old-model=models/tub_3_26-05-09.pth \
   --new-model=models/hello_world_tub3.pth
 
@@ -75,7 +75,7 @@ uv run --env-file .env python -c "import gz.transport13; print('OK')"
 ```
 
 Web UI: http://127.0.0.1:8887
-- Static files served from `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/` (see `web.py:112`). Edit `main.js` there, not the copy in `donkeydrone/templates/static/`.
+- Static files served from `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/` (see `web.py:112`). Edit `main.js` there, not the copy in `nanopilot/templates/static/`.
 
 ## Fresh Session Checklist
 
@@ -87,7 +87,7 @@ Web UI: http://127.0.0.1:8887
    ```
 3. Avoid full/default training unless explicitly requested. Use bounded flags (`--max-epochs`, `--max-samples`, `--batch-size`, `--no-model-summary`) for smoke runs.
 4. Use `bash ./scripts/stop_all.sh` before and after sim tests if Gazebo/BetaFlight/XboxBridge might already be running.
-5. Do not edit `donkeydrone/config.py` for local tuning; edit `donkeydrone/drone_config_65mm.py` or `donkeydrone/drone_config_80mm.py`.
+5. Do not edit `nanopilot/config.py` for local tuning; edit `nanopilot/drone_config_65mm.py` or `nanopilot/drone_config_80mm.py`.
 
 ## Verification / Tests
 
@@ -96,21 +96,21 @@ There is no formal pytest suite. Use these targeted checks:
 ```bash
 # Import/compile check for the main Python modules
 uv run --env-file .env python -m py_compile \
-  donkeydrone/drone_gym.py donkeydrone/drone_env.py donkeydrone/gz_telemetry.py \
-  donkeydrone/tub_schema.py donkeydrone/drone_manage.py \
-  donkeydrone/autonomous_collect.py donkeydrone/dataset.py \
-  donkeydrone/torch_model.py donkeydrone/torch_pilot.py \
-  donkeydrone/torch_train.py donkeydrone/evaluate.py donkeydrone/smoke_test.py
+  nanopilot/drone_gym.py nanopilot/drone_env.py nanopilot/gz_telemetry.py \
+  nanopilot/tub_schema.py nanopilot/drone_manage.py \
+  nanopilot/autonomous_collect.py nanopilot/dataset.py \
+  nanopilot/torch_model.py nanopilot/torch_pilot.py \
+  nanopilot/torch_train.py nanopilot/evaluate.py nanopilot/smoke_test.py
 
 # Script CLI/import smoke checks
-uv run --env-file .env python donkeydrone/torch_train.py --help
-uv run --env-file .env python donkeydrone/evaluate.py --help
-uv run --env-file .env python donkeydrone/autonomous_collect.py --help
+uv run --env-file .env python nanopilot/torch_train.py --help
+uv run --env-file .env python nanopilot/evaluate.py --help
+uv run --env-file .env python nanopilot/autonomous_collect.py --help
 
 # Model load/inference smoke for a .pth checkpoint
 uv run --env-file .env python - <<'PY'
 import numpy as np
-from donkeydrone.torch_pilot import TorchPilot
+from nanopilot.torch_pilot import TorchPilot
 pilot = TorchPilot(input_shape=(3, 240, 320), seq_len=3)
 pilot.load('models/hello_world_tub3.pth')
 print(tuple(round(float(v), 6) for v in pilot.run(np.zeros((240, 320, 3), dtype=np.uint8))))
@@ -124,7 +124,7 @@ For headless scripted collection:
 
 ```bash
 GZ_HEADLESS=1 ./scripts/start.sh --no-manage --airframe=65mm
-uv run --env-file .env python donkeydrone/autonomous_collect.py \
+uv run --env-file .env python nanopilot/autonomous_collect.py \
   --airframe=65mm --duration=3 --warmup=1 --rate-hz=5 --ready-timeout=30
 bash ./scripts/stop_all.sh
 ```
@@ -182,28 +182,28 @@ RC packet: `struct.pack('<d', timestamp)` + 16 × `struct.pack('<H', channel)` =
 
 | File | Purpose |
 |------|---------|
-| `donkeydrone/drone_manage.py` | Main entry point |
-| `donkeydrone/drone_gym.py` | DroneGymEnv: BetaFlight RC UDP + camera bridge |
-| `donkeydrone/drone_env.py` | Shared builder for constructing `DroneGymEnv` from config |
-| `donkeydrone/gz_telemetry.py` | Gazebo pose/IMU telemetry helpers |
-| `donkeydrone/drone_config_80mm.py` | Pavo Pico II O4 (80mm, 79g with selected battery) config — default airframe |
-| `donkeydrone/drone_config_65mm.py` | Air65 (65mm, ~31g AUW) config — alternate airframe |
-| `donkeydrone/config.py` | Base DonkeyCar config (**do not modify**) |
-| `donkeydrone/gz_camera_worker.py` | Subprocess: gz-transport camera → shared memory |
-| `donkeydrone/tub_schema.py` | Shared tub input/type schema and IMU key list |
-| `donkeydrone/dataset.py` | PyTorch tub dataset loader for image + IMU + previous controls |
-| `donkeydrone/torch_model.py` | Current PyTorch `LinearModel` architecture |
-| `donkeydrone/torch_pilot.py` | Inference wrapper for vehicle loop |
-| `donkeydrone/torch_train.py` | Training script |
-| `donkeydrone/evaluate.py` | Offline checkpoint evaluator and model comparison CLI |
-| `donkeydrone/autonomous_collect.py` | Headless scripted data collector |
-| `donkeydrone/smoke_test.py` | Lightweight local smoke checks |
+| `nanopilot/drone_manage.py` | Main entry point |
+| `nanopilot/drone_gym.py` | DroneGymEnv: BetaFlight RC UDP + camera bridge |
+| `nanopilot/drone_env.py` | Shared builder for constructing `DroneGymEnv` from config |
+| `nanopilot/gz_telemetry.py` | Gazebo pose/IMU telemetry helpers |
+| `nanopilot/drone_config_80mm.py` | Pavo Pico II O4 (80mm, 79g with selected battery) config — default airframe |
+| `nanopilot/drone_config_65mm.py` | Air65 (65mm, ~31g AUW) config — alternate airframe |
+| `nanopilot/config.py` | Base DonkeyCar config (**do not modify**) |
+| `nanopilot/gz_camera_worker.py` | Subprocess: gz-transport camera → shared memory |
+| `nanopilot/tub_schema.py` | Shared tub input/type schema and IMU key list |
+| `nanopilot/dataset.py` | PyTorch tub dataset loader for image + IMU + previous controls |
+| `nanopilot/torch_model.py` | Current PyTorch `LinearModel` architecture |
+| `nanopilot/torch_pilot.py` | Inference wrapper for vehicle loop |
+| `nanopilot/torch_train.py` | Training script |
+| `nanopilot/evaluate.py` | Offline checkpoint evaluator and model comparison CLI |
+| `nanopilot/autonomous_collect.py` | Headless scripted data collector |
+| `nanopilot/smoke_test.py` | Lightweight local smoke checks |
 | `scripts/start.sh` | One-command launcher. Flags: `--airframe=65mm\|80mm` (default 80mm), `--no-manage` (sim stack only). |
 | `scripts/stop_all.sh` | Force-kill all processes |
 | `scripts/stop-all.sh` | Compatibility wrapper around `scripts/stop_all.sh` |
 | `scripts/collect_train.sh` | Starts sim stack, runs scripted collection, then trains |
 | `scripts/test_thrust.sh` | Wrapper: `start.sh --no-manage --airframe=$X` + `test_thrust.py` + teardown |
-| `donkeydrone/test_thrust.py` | Ramps throttle 1000→2000 PWM and reports altitude at each step; used for tuning `motorConstant` and finding hover PWM |
+| `nanopilot/test_thrust.py` | Ramps throttle 1000→2000 PWM and reports altitude at each step; used for tuning `motorConstant` and finding hover PWM |
 | `data/` | Recorded DonkeyCar tub folders (`tub_N_YY-MM-DD`) |
 | `models/` | Saved `.pth` checkpoints and baseline pilot models |
 | `worlds/drone_course_65mm.sdf` | 65mm Air65 world (includes `betaloop_drone_cam_65mm`) |
@@ -221,17 +221,17 @@ RC packet: `struct.pack('<d', timestamp)` + 16 × `struct.pack('<H', channel)` =
 | `~/dev/betaflight/` | BetaFlight firmware source (SITL target) |
 | `~/dev/betaflight/obj/main/betaflight_SITL.elf` | Compiled BetaFlight SITL binary |
 | `~/.gz/sim/8/server.config` | Gazebo default server plugins (Physics, UserCommands, SceneBroadcaster) |
-| `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/main.js` | Web UI JS served at runtime — edit this file, NOT `donkeydrone/templates/static/main.js` |
+| `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/main.js` | Web UI JS served at runtime — edit this file, NOT `nanopilot/templates/static/main.js` |
 
 ## Camera Modes
 
-Controlled by `DRONE_CAMERA_SOURCE` in your `donkeydrone/drone_config_XXmm.py`:
+Controlled by `DRONE_CAMERA_SOURCE` in your `nanopilot/drone_config_XXmm.py`:
 - `"gz_transport"` (default): native macOS, Gazebo Harmonic, gz-python bindings
 - `"rtsp"`: Docker legacy mode, Gazebo Classic, OpenCV VideoCapture
 
 ## CNN Model (LinearModel)
 
-- Current model in `donkeydrone/torch_model.py` uses a residual CNN image branch, GRU IMU branch, previous-control feedback branch, and multi-head attention fusion.
+- Current model in `nanopilot/torch_model.py` uses a residual CNN image branch, GRU IMU branch, previous-control feedback branch, and multi-head attention fusion.
 - Inputs: image `(B, 3, H, W)` float32 `[0,1]`, IMU sequence `(B, seq_len, 6)`, previous controls `(B, 4)`.
 - Output: `(B, 4)` for `[steering/yaw, throttle/pitch, roll, altitude]`.
 - Offline training/evaluation use `TubDataset`, which returns `(image, imu, prev_ctrl, target)`.
@@ -250,9 +250,9 @@ Current useful local models:
 - `models/tub_3_26-05-09.pth`: partial checkpoint from a longer run that was manually stopped.
 - `models/pilot.pth`: older baseline.
 
-`donkeydrone/evaluate.py` can load current `control_feedback` checkpoints and legacy `legacy_imu_fc` / `legacy_imu_gru` formats for offline comparison.
+`nanopilot/evaluate.py` can load current `control_feedback` checkpoints and legacy `legacy_imu_fc` / `legacy_imu_gru` formats for offline comparison.
 
-## Important Config Parameters (`donkeydrone/drone_config_{65,80}mm.py`)
+## Important Config Parameters (`nanopilot/drone_config_{65,80}mm.py`)
 
 - `DRONE_GZ_CAMERA_TOPIC`: must match world + model name — the default 80mm config points at `baylands_80mm`; the retained 65mm config points at `drone_course_65mm`
 - `GZ_WORLD` env var in `scripts/start.sh`: defaults to `baylands_80mm` for the 80mm airframe and `drone_course_65mm` for 65mm; override manually only when selecting a specific world
@@ -368,7 +368,7 @@ Files:
 
 Observed symptom: after sideways roll input, returning to level stops lateral acceleration but does not bleed off existing XY velocity, producing a "skating rink" effect.
 
-Validation now exists in `donkeydrone/test_thrust.py --mode=lateral-coast`. It:
+Validation now exists in `nanopilot/test_thrust.py --mode=lateral-coast`. It:
 1. Climbs to altitude.
 2. Applies roll for a configurable acceleration phase.
 3. Centers roll and samples XY speed, XY drift, altitude drift, and speed half-life.
@@ -494,17 +494,17 @@ Goal: collect new-format drone data with no human intervention, then verify trai
 - `imu/gyr_x`, `imu/gyr_y`, `imu/gyr_z`
 
 Recent changes in progress:
-- `donkeydrone/drone_gym.py` now subscribes to Gazebo pose + IMU telemetry and can output raw 6-axis IMU fields alongside position, attitude, and velocity.
+- `nanopilot/drone_gym.py` now subscribes to Gazebo pose + IMU telemetry and can output raw 6-axis IMU fields alongside position, attitude, and velocity.
 - `DRONE_RECORD_IMU = True` was added to both `drone_config_65mm.py` and `drone_config_80mm.py`.
-- `donkeydrone/drone_manage.py` records the new IMU fields into manual/autopilot tubs when `DRONE_RECORD_IMU` is enabled.
-- `donkeydrone/torch_pilot.py` was updated so `.pth` inference passes an IMU history tensor to `LinearModel`; the new model no longer works with image-only inference.
-- `donkeydrone/dataset.py` was updated for new-format tubs:
+- `nanopilot/drone_manage.py` records the new IMU fields into manual/autopilot tubs when `DRONE_RECORD_IMU` is enabled.
+- `nanopilot/torch_pilot.py` was updated so `.pth` inference passes an IMU history tensor to `LinearModel`; the new model no longer works with image-only inference.
+- `nanopilot/dataset.py` was updated for new-format tubs:
   - filters only `*.catalog` files, not `catalog_*.catalog_manifest`
   - skips non-sample catalog rows missing `cam/image_array`
   - resolves images from both tub root and DonkeyCar v2 `images/`
   - warns/counts records missing the six required IMU keys
-- `donkeydrone/gz_camera_worker.py` unregisters the attached shared memory from the child process resource tracker; parent owns unlinking.
-- `donkeydrone/autonomous_collect.py` is a headless scripted collector that directly writes a tub after confirming:
+- `nanopilot/gz_camera_worker.py` unregisters the attached shared memory from the child process resource tracker; parent owns unlinking.
+- `nanopilot/autonomous_collect.py` is a headless scripted collector that directly writes a tub after confirming:
   - BetaFlight MSP is reachable on TCP 5761
   - camera frames are nonblank
   - RC/control loop has reached hover throttle after arming
@@ -514,9 +514,9 @@ Recent changes in progress:
 Validated test run:
 ```bash
 GZ_HEADLESS=1 ./scripts/start.sh --no-manage --airframe=65mm
-uv run --env-file .env python donkeydrone/autonomous_collect.py \
+uv run --env-file .env python nanopilot/autonomous_collect.py \
   --airframe=65mm --duration=3 --warmup=1 --rate-hz=5 --ready-timeout=30
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_210_26-05-09 --model=/private/tmp/tub_210_test.pth --max-epochs=1
 bash ./scripts/stop_all.sh
 ```
@@ -535,8 +535,8 @@ Known notes:
 - In manual web-controller runs, `AUTO_RECORD_ON_THROTTLE` may not record if only altitude/motor throttle changes and `user/throttle` stays zero; the scripted collector bypasses this by writing records directly.
 
 Suggested next refactor:
-1. Create a shared schema module, e.g. `donkeydrone/tub_schema.py`, with `DRONE_TUB_INPUTS`, `DRONE_TUB_TYPES`, and `IMU_KEYS`; use it from `drone_manage.py`, `autonomous_collect.py`, and `dataset.py`.
-2. Extract Gazebo telemetry helpers (`_SimTelemetry`, `_PoseTracker`, quaternion conversion) from `drone_gym.py` into a focused module, e.g. `donkeydrone/gz_telemetry.py`.
+1. Create a shared schema module, e.g. `nanopilot/tub_schema.py`, with `DRONE_TUB_INPUTS`, `DRONE_TUB_TYPES`, and `IMU_KEYS`; use it from `drone_manage.py`, `autonomous_collect.py`, and `dataset.py`.
+2. Extract Gazebo telemetry helpers (`_SimTelemetry`, `_PoseTracker`, quaternion conversion) from `drone_gym.py` into a focused module, e.g. `nanopilot/gz_telemetry.py`.
 3. Extract shared `build_drone_env(cfg, airframe=...)` construction so `drone_manage.py` and `autonomous_collect.py` do not duplicate the long `DroneGymEnv(...)` argument list.
 4. Consider making autonomous flight profiles pluggable (`--profile=figure-eight`, `--profile=hover-sweep`, etc.) once the code is cleaner.
 
@@ -545,20 +545,20 @@ Suggested next refactor:
 Session goal was to continue the new-format drone data work, refactor it, validate real scripted collection, then start objective model evaluation.
 
 Completed refactor work:
-- Added shared tub schema module `donkeydrone/tub_schema.py` with `DRONE_TUB_INPUTS`, `DRONE_TUB_TYPES`, `IMU_KEYS`, and `drone_tub_schema(...)`.
-- Added `donkeydrone/gz_telemetry.py` and moved Gazebo telemetry helpers out of `drone_gym.py`:
+- Added shared tub schema module `nanopilot/tub_schema.py` with `DRONE_TUB_INPUTS`, `DRONE_TUB_TYPES`, `IMU_KEYS`, and `drone_tub_schema(...)`.
+- Added `nanopilot/gz_telemetry.py` and moved Gazebo telemetry helpers out of `drone_gym.py`:
   - pose + IMU subscription
   - quaternion-to-Euler conversion
   - pose tracker for altitude-hold vertical velocity
-- Added `donkeydrone/drone_env.py` with shared `build_drone_env(...)`.
+- Added `nanopilot/drone_env.py` with shared `build_drone_env(...)`.
 - Updated `drone_manage.py`, `autonomous_collect.py`, and `dataset.py` to use the shared schema and env construction.
 - Refactor behavior was compile checked:
   ```bash
   uv run --env-file .env python -m py_compile \
-    donkeydrone/drone_gym.py donkeydrone/drone_env.py donkeydrone/gz_telemetry.py \
-    donkeydrone/tub_schema.py donkeydrone/drone_manage.py \
-    donkeydrone/autonomous_collect.py donkeydrone/dataset.py \
-    donkeydrone/torch_train.py donkeydrone/torch_pilot.py
+    nanopilot/drone_gym.py nanopilot/drone_env.py nanopilot/gz_telemetry.py \
+    nanopilot/tub_schema.py nanopilot/drone_manage.py \
+    nanopilot/autonomous_collect.py nanopilot/dataset.py \
+    nanopilot/torch_train.py nanopilot/torch_pilot.py
   ```
 - `autonomous_collect.py --help` imports cleanly after refactor.
 - One-epoch training smoke on `data/tub_210_26-05-09` completed and saved `/private/tmp/tub_210_refactor_smoke.pth`.
@@ -566,7 +566,7 @@ Completed refactor work:
 Real collection validation after refactor:
 ```bash
 GZ_HEADLESS=1 ./scripts/start.sh --no-manage --airframe=65mm
-uv run --env-file .env python donkeydrone/autonomous_collect.py \
+uv run --env-file .env python nanopilot/autonomous_collect.py \
   --airframe=65mm --duration=3 --warmup=1 --rate-hz=5 --ready-timeout=30
 bash ./scripts/stop_all.sh
 ```
@@ -579,7 +579,7 @@ Results:
 - Sim stack was stopped afterward. `pgrep -fl 'betaflight_SITL|gz sim|ruby.*gz'` returned nothing.
 
 Model/evaluation work:
-- User created `donkeydrone/evaluate.py` from Gemini guidance. Initial file included pasted markdown after Python code and failed with:
+- User created `nanopilot/evaluate.py` from Gemini guidance. Initial file included pasted markdown after Python code and failed with:
   `SyntaxError: unterminated string literal`.
 - Replaced it with a CLI evaluator that supports:
   - `--model` for single-model metrics.
@@ -587,7 +587,7 @@ Model/evaluation work:
   - `--tubs`, `--image-h`, `--image-w`, `--seq-len`, `--batch-size`.
   - Metrics: per-axis MAE, RMSE, correlation, and output jitter.
 - `evaluate.py` also detects old IMU-FC checkpoints (`imu_fc.*` keys) and loads them with a compatibility model. This matters because current `torch_model.py` now uses `imu_gru`, while available smoke checkpoints from earlier in the day use `imu_fc`.
-- `uv run --env-file .env python -m py_compile donkeydrone/evaluate.py` passed.
+- `uv run --env-file .env python -m py_compile nanopilot/evaluate.py` passed.
 
 Available checkpoints in `/private/tmp`:
 - `/private/tmp/tub_210_test.pth` - old IMU-FC checkpoint from earlier smoke.
@@ -596,7 +596,7 @@ Available checkpoints in `/private/tmp`:
 
 Evaluation runs/results:
 ```bash
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_211_26-05-09 \
   --old-model=/private/tmp/tub_210_test.pth \
   --new-model=/private/tmp/tub_210_refactor_smoke.pth
@@ -607,7 +607,7 @@ uv run --env-file .env python donkeydrone/evaluate.py \
 
 Then trained a current GRU smoke checkpoint:
 ```bash
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_210_26-05-09 \
   --model=/private/tmp/tub_210_gru_smoke.pth \
   --max-epochs=1
@@ -617,7 +617,7 @@ uv run --env-file .env python donkeydrone/torch_train.py \
 
 Compared old IMU-FC vs current GRU smoke on held-out `tub_211`:
 ```bash
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_211_26-05-09 \
   --old-model=/private/tmp/tub_210_refactor_smoke.pth \
   --new-model=/private/tmp/tub_210_gru_smoke.pth
@@ -629,10 +629,10 @@ uv run --env-file .env python donkeydrone/evaluate.py \
 Current working tree at handoff:
 ```bash
 git status --short --untracked-files=all
- M donkeydrone/smoke_test.py
- M donkeydrone/torch_model.py
- M donkeydrone/torch_train.py
-?? donkeydrone/evaluate.py
+ M nanopilot/smoke_test.py
+ M nanopilot/torch_model.py
+ M nanopilot/torch_train.py
+?? nanopilot/evaluate.py
 ```
 
 Important caution:
@@ -649,38 +649,38 @@ Recommended next steps:
 ## Current Handoff (2026-05-09 late evening)
 
 Continued evaluation/model workflow work:
-- `donkeydrone/evaluate.py` now defaults to the fixed held-out benchmark tub `data/tub_209_26-05-09` when `--tubs`/`--benchmark-tubs` are omitted. This tub has `50` samples, `missing_imu=0`, and `nonzero_imu=50`.
-- The default benchmark can be overridden with `--tubs`, `--benchmark-tubs`, or `DONKEYDRONE_BENCHMARK_TUBS`.
+- `nanopilot/evaluate.py` now defaults to the fixed held-out benchmark tub `data/tub_209_26-05-09` when `--tubs`/`--benchmark-tubs` are omitted. This tub has `50` samples, `missing_imu=0`, and `nonzero_imu=50`.
+- The default benchmark can be overridden with `--tubs`, `--benchmark-tubs`, or `NANOPILOT_BENCHMARK_TUBS`.
 - Evaluator now supports three checkpoint formats:
   - `legacy_imu_fc` (`imu_fc.*` keys)
   - `legacy_imu_gru` (`imu_gru.*` keys but no control-feedback branch)
   - current `control_feedback` checkpoints (`ctrl_fc.*` keys)
 - Evaluator now accepts dataset batches as `(image, imu, prev_ctrl, target)`, computes an equal-weight MAE score by default, accepts `--weights steering,throttle,altitude`, and can write machine-readable results with `--json-output`.
 - `torch_model.LinearModel.forward(...)` now accepts `prev_ctrl=None` and substitutes zero controls, preserving simple two-input smoke/debug calls while training/evaluation pass real previous controls.
-- `torch_pilot.py` now passes previous model outputs back into the model as `prev_ctrl`, so runtime inference matches the current training graph. Its import also works both as `torch_pilot` from the DonkeyCar script path and as `donkeydrone.torch_pilot`.
+- `torch_pilot.py` now passes previous model outputs back into the model as `prev_ctrl`, so runtime inference matches the current training graph. Its import also works both as `torch_pilot` from the DonkeyCar script path and as `nanopilot.torch_pilot`.
 
 Validation performed:
 ```bash
 uv run --env-file .env python -m py_compile \
-  donkeydrone/evaluate.py donkeydrone/torch_model.py donkeydrone/torch_pilot.py \
-  donkeydrone/torch_train.py donkeydrone/smoke_test.py donkeydrone/dataset.py
+  nanopilot/evaluate.py nanopilot/torch_model.py nanopilot/torch_pilot.py \
+  nanopilot/torch_train.py nanopilot/smoke_test.py nanopilot/dataset.py
 
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --old-model=/private/tmp/tub_210_refactor_smoke.pth \
   --new-model=/private/tmp/tub_210_gru_smoke.pth \
-  --json-output=/private/tmp/donkeydrone_eval_compare.json
+  --json-output=/private/tmp/nanopilot_eval_compare.json
 
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_210_26-05-09 \
   --model=/private/tmp/tub_210_ctrl_smoke.pth \
   --max-epochs=1
 
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --old-model=/private/tmp/tub_210_refactor_smoke.pth \
   --new-model=/private/tmp/tub_210_ctrl_smoke.pth \
-  --json-output=/private/tmp/donkeydrone_eval_ctrl_compare.json
+  --json-output=/private/tmp/nanopilot_eval_ctrl_compare.json
 
-uv run --env-file .env python donkeydrone/smoke_test.py
+uv run --env-file .env python nanopilot/smoke_test.py
 ```
 
 Benchmark results on held-out `data/tub_209_26-05-09`:
@@ -693,7 +693,7 @@ Additional runtime check:
 ```bash
 uv run --env-file .env python - <<'PY'
 import numpy as np
-from donkeydrone.torch_pilot import TorchPilot
+from nanopilot.torch_pilot import TorchPilot
 pilot = TorchPilot(input_shape=(3, 240, 320), seq_len=3)
 pilot.load('/private/tmp/tub_210_ctrl_smoke.pth')
 print(tuple(round(v, 6) for v in pilot.run(np.zeros((240, 320, 3), dtype=np.uint8))))
@@ -704,13 +704,13 @@ PY
 Current working tree after this step:
 ```bash
  M AGENT.md
- M donkeydrone/evaluate.py
- M donkeydrone/torch_model.py
- M donkeydrone/torch_pilot.py
+ M nanopilot/evaluate.py
+ M nanopilot/torch_model.py
+ M nanopilot/torch_pilot.py
 ```
 
 Recommended next steps:
-1. Collect a larger dedicated benchmark tub and update `DEFAULT_BENCHMARK_TUBS` (or use `DONKEYDRONE_BENCHMARK_TUBS`) so model comparisons are based on more than 50 held-out samples.
+1. Collect a larger dedicated benchmark tub and update `DEFAULT_BENCHMARK_TUBS` (or use `NANOPILOT_BENCHMARK_TUBS`) so model comparisons are based on more than 50 held-out samples.
 2. Train current control-feedback checkpoints on more than `data/tub_210_26-05-09`; the present comparison is useful for plumbing, not architecture selection.
 3. Consider moving checkpoint compatibility classes out of `evaluate.py` if old checkpoints need to be loaded by runtime inference too.
 
@@ -728,7 +728,7 @@ Recent flight / controller work:
   - frames arrived at ~60Hz
   - sticks, RT, A, and B were detected
   - `nonzero_input_seen=True`
-- `scripts/stop_all.sh` already kills XboxBridge; it was hardened to match both `XboxBridge.app` and `Contents/MacOS/XboxBridge`, and removes `/tmp/donkeydrone_xbox.sock`.
+- `scripts/stop_all.sh` already kills XboxBridge; it was hardened to match both `XboxBridge.app` and `Contents/MacOS/XboxBridge`, and removes `/tmp/nanopilot_xbox.sock`.
 - Added `scripts/stop-all.sh` as a compatibility wrapper around `scripts/stop_all.sh`.
 - `scripts/start.sh` now explicitly stops XboxBridge in its Ctrl+C/exit cleanup trap and before launching a fresh bridge for `--xbox`.
 - Xbox arm debugging showed:
@@ -756,7 +756,7 @@ Data / model artifacts available now:
 Training status:
 - A full/default `torch_train.py` run on `data/tub_3_26-05-09` was started:
   ```bash
-  uv run --env-file .env python donkeydrone/torch_train.py \
+  uv run --env-file .env python nanopilot/torch_train.py \
     --tubs=data/tub_3_26-05-09 \
     --model=models/tub_3_26-05-09.pth
   ```
@@ -771,7 +771,7 @@ Recommended next-session plan:
 2. Produce a test autopilot model, e.g. `models/hello_world_tub3.pth`.
 3. Run a quick evaluator pass on held-out data if practical:
    ```bash
-   uv run --env-file .env python donkeydrone/evaluate.py \
+   uv run --env-file .env python nanopilot/evaluate.py \
      --tubs=data/tub_4_26-05-09 \
      --model=models/hello_world_tub3.pth
    ```
@@ -787,7 +787,7 @@ Recommended next-session plan:
 Bounded hello-world training run completed successfully.
 
 Code change:
-- `donkeydrone/torch_train.py` now supports bounded smoke-training flags:
+- `nanopilot/torch_train.py` now supports bounded smoke-training flags:
   - `--max-samples` uses a deterministic, evenly spaced subset of the loaded dataset.
   - `--batch-size` overrides config `BATCH_SIZE`.
   - `--train-split` overrides config `TRAIN_TEST_SPLIT`.
@@ -797,15 +797,15 @@ Code change:
 Validation:
 ```bash
 uv run --env-file .env python -m py_compile \
-  donkeydrone/torch_train.py donkeydrone/evaluate.py donkeydrone/dataset.py \
-  donkeydrone/torch_model.py donkeydrone/torch_pilot.py
+  nanopilot/torch_train.py nanopilot/evaluate.py nanopilot/dataset.py \
+  nanopilot/torch_model.py nanopilot/torch_pilot.py
 
-uv run --env-file .env python donkeydrone/torch_train.py --help
+uv run --env-file .env python nanopilot/torch_train.py --help
 ```
 
 Training command:
 ```bash
-time uv run --env-file .env python donkeydrone/torch_train.py \
+time uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_3_26-05-09 \
   --model=models/hello_world_tub3.pth \
   --max-epochs=1 \
@@ -826,7 +826,7 @@ Training result:
 
 Quick evaluation on small held-out tub:
 ```bash
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_4_26-05-09 \
   --model=models/hello_world_tub3.pth \
   --json-output=/private/tmp/hello_world_tub3_eval.json
@@ -846,7 +846,7 @@ Runtime load smoke:
 ```bash
 uv run --env-file .env python - <<'PY'
 import numpy as np
-from donkeydrone.torch_pilot import TorchPilot
+from nanopilot.torch_pilot import TorchPilot
 pilot = TorchPilot(input_shape=(3, 240, 320), seq_len=3)
 pilot.load('models/hello_world_tub3.pth')
 print(tuple(round(float(v), 6) for v in pilot.run(np.zeros((240, 320, 3), dtype=np.uint8))))
@@ -875,7 +875,7 @@ Full `data/tub_3_26-05-09` training run completed.
 
 Command:
 ```bash
-time uv run --env-file .env python donkeydrone/torch_train.py \
+time uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_3_26-05-09 \
   --model=models/tub_3_26-05-09_full.pth \
   --max-epochs=10 \
@@ -903,7 +903,7 @@ Training result:
 
 Quick evaluation on `data/tub_4_26-05-09`:
 ```bash
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_4_26-05-09 \
   --model=models/tub_3_26-05-09_full.pth \
   --json-output=/private/tmp/tub3_full_eval_tub4.json
@@ -923,7 +923,7 @@ Runtime load smoke:
 ```bash
 uv run --env-file .env python - <<'PY'
 import numpy as np
-from donkeydrone.torch_pilot import TorchPilot
+from nanopilot.torch_pilot import TorchPilot
 pilot = TorchPilot(input_shape=(3, 240, 320), seq_len=3)
 pilot.load('models/tub_3_26-05-09_full.pth')
 print(tuple(round(float(v), 6) for v in pilot.run(np.zeros((240, 320, 3), dtype=np.uint8))))
@@ -962,25 +962,25 @@ Code areas changed:
 Validation performed:
 ```bash
 uv run --env-file .env python -m py_compile \
-  donkeydrone/drone_gym.py donkeydrone/drone_env.py donkeydrone/drone_manage.py \
-  donkeydrone/xbox_controller.py donkeydrone/tub_schema.py donkeydrone/dataset.py \
-  donkeydrone/torch_model.py donkeydrone/torch_pilot.py donkeydrone/torch_train.py \
-  donkeydrone/evaluate.py donkeydrone/autonomous_collect.py donkeydrone/smoke_test.py \
+  nanopilot/drone_gym.py nanopilot/drone_env.py nanopilot/drone_manage.py \
+  nanopilot/xbox_controller.py nanopilot/tub_schema.py nanopilot/dataset.py \
+  nanopilot/torch_model.py nanopilot/torch_pilot.py nanopilot/torch_train.py \
+  nanopilot/evaluate.py nanopilot/autonomous_collect.py nanopilot/smoke_test.py \
   xbox_bridge/smoke_test.py
 
 bash -n scripts/start.sh scripts/collect_train.sh scripts/test_thrust.sh
 bash xbox_bridge/build.sh
-uv run --env-file .env python donkeydrone/smoke_test.py
+uv run --env-file .env python nanopilot/smoke_test.py
 ```
 
 Bounded four-output training/eval smoke:
 ```bash
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_3_26-05-09 \
   --model=/private/tmp/roll4_smoke.pth \
   --max-epochs=1 --max-samples=64 --batch-size=16 --no-model-summary
 
-uv run --env-file .env python donkeydrone/evaluate.py \
+uv run --env-file .env python nanopilot/evaluate.py \
   --tubs=data/tub_4_26-05-09 \
   --model=/private/tmp/roll4_smoke.pth
 ```
@@ -998,7 +998,7 @@ Important compatibility note:
 
 Current workspace notes:
 - `README.md` had user edits before this handoff; do not overwrite them casually.
-- `donkeydrone/drone_config_65mm.py` may have local/user tuning, including camera/world settings; inspect before editing.
+- `nanopilot/drone_config_65mm.py` may have local/user tuning, including camera/world settings; inspect before editing.
 - Sim processes were stopped after validation; `pgrep -fl 'gz sim|gzserver|gzclient|ArduCopter|ardupilot|drone_manage|sim_vehicle|mavproxy'` returned nothing.
 
 ## Current Handoff (2026-05-16 lateral drag investigation)
@@ -1009,14 +1009,14 @@ Finding:
 - The Gazebo airframe SDFs in `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_65mm/model.sdf` and `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf` set base-link `<velocity_decay><linear>0.0</linear><angular>0.0</angular></velocity_decay>`.
 - Current model has rotor/motor damping and yaw drag terms, but no meaningful body translational drag. So Angle mode levels the drone but does not remove existing XY velocity.
 
-Added `donkeydrone/test_thrust.py --mode=lateral-coast`:
+Added `nanopilot/test_thrust.py --mode=lateral-coast`:
 - `make_channels(...)` now accepts `roll_pwm` for CH1.
 - New `run_lateral_coast_test(...)` climbs, applies sideways roll, centers roll, then logs XY speed, XY drift, altitude drift, and speed half-life.
 - New args: `--lateral-roll-pwm`, `--lateral-accel-s`, `--lateral-coast-s`.
 
 Validation:
 ```bash
-uv run --env-file .env python -m py_compile donkeydrone/test_thrust.py
+uv run --env-file .env python -m py_compile nanopilot/test_thrust.py
 
 ./scripts/test_thrust.sh --airframe=80mm --mode=lateral-coast \
   --airborne-hover=1475 --airborne-climb=1500 --airborne-climb-s=1.5 \
@@ -1076,7 +1076,7 @@ Result caveat: the sweep was not useful for hover tuning because all samples wer
 
 Validation completed:
 ```bash
-uv run --env-file .env python -m py_compile donkeydrone/test_thrust.py
+uv run --env-file .env python -m py_compile nanopilot/test_thrust.py
 bash -n scripts/test_thrust.sh scripts/start.sh scripts/stop_all.sh
 cmake --build /Users/Dan/dev/aeroloop_gazebo/plugins/build
 gz sdf -k /Users/Dan/dev/aeroloop_gazebo/models/betaloop_drone_cam_65mm/model.sdf
@@ -1093,8 +1093,8 @@ Finding:
 - Angle vs Acro did not materially change the hover result, so this does not look like a BetaFlight altitude-controller/PID issue. The test uses direct CH3 motor throttle; no BF altitude controller is active.
 
 Code changed:
-- `donkeydrone/test_thrust.py`: `run_inflight_hover_sweep` now ignores samples below `0.25m` for summary/interpolation and only interpolates zero-vz from adjacent in-flight samples.
-- `donkeydrone/drone_config_80mm.py`: kept `DRONE_HOVER_THROTTLE = 1475`, updated `DRONE_ALTITUDE_HOLD_K = 45.0`.
+- `nanopilot/test_thrust.py`: `run_inflight_hover_sweep` now ignores samples below `0.25m` for summary/interpolation and only interpolates zero-vz from adjacent in-flight samples.
+- `nanopilot/drone_config_80mm.py`: kept `DRONE_HOVER_THROTTLE = 1475`, updated `DRONE_ALTITUDE_HOLD_K = 45.0`.
 
 Commands/results:
 ```bash
@@ -1165,8 +1165,8 @@ Conclusion:
 Validation:
 ```bash
 uv run --env-file .env python -m py_compile \
-  donkeydrone/test_thrust.py donkeydrone/drone_config_80mm.py \
-  donkeydrone/drone_env.py donkeydrone/drone_gym.py
+  nanopilot/test_thrust.py nanopilot/drone_config_80mm.py \
+  nanopilot/drone_env.py nanopilot/drone_gym.py
 bash -n scripts/test_thrust.sh scripts/start.sh scripts/stop_all.sh
 ```
 
@@ -1180,7 +1180,7 @@ Implementation:
 - `~/dev/aeroloop_gazebo/plugins/BetaflightPlugin.cc` reads `angularVelocityDecay` and applies first-order angular damping:
   - `torque = -k * I_world * omega_world`
   - This mirrors the earlier horizontal plugin-backed drag because Bullet/Harmonic did not visibly honor SDF `velocity_decay` for linear damping.
-- `donkeydrone/test_thrust.py --mode=attitude` now passes through `--yaw-pwm` and `--airborne-phase-s`; previously attitude mode silently used its defaults.
+- `nanopilot/test_thrust.py --mode=attitude` now passes through `--yaw-pwm` and `--airborne-phase-s`; previously attitude mode silently used its defaults.
 
 Selected angular value:
 - `angularVelocityDecay = 0.50 1/s`
@@ -1190,7 +1190,7 @@ Selected angular value:
 Validation and measurements:
 ```bash
 cmake --build /Users/Dan/dev/aeroloop_gazebo/plugins/build
-uv run --env-file .env python -m py_compile donkeydrone/test_thrust.py
+uv run --env-file .env python -m py_compile nanopilot/test_thrust.py
 gz sdf -k /Users/Dan/dev/aeroloop_gazebo/models/betaloop_drone_cam_65mm/model.sdf
 gz sdf -k /Users/Dan/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf
 ```
@@ -1252,26 +1252,26 @@ Regression checks with angular `0.50`:
 Kicked off the 640x480 resolution project.
 
 Implementation:
-- `donkeydrone/drone_config_80mm.py`: `IMAGE_W = 640`, `IMAGE_H = 480`.
-- `donkeydrone/drone_config_65mm.py`: `IMAGE_W = 640`, `IMAGE_H = 480`.
+- `nanopilot/drone_config_80mm.py`: `IMAGE_W = 640`, `IMAGE_H = 480`.
+- `nanopilot/drone_config_65mm.py`: `IMAGE_W = 640`, `IMAGE_H = 480`.
 - External Gazebo camera SDFs already render `640x480` at 30Hz for both 65mm and 80mm, so no external SDF edit was needed.
 - `README.md` now documents that current `LinearModel` uses adaptive global pooling, so higher input resolution does not increase model parameter count, but it can increase render, JPEG decode, transform, memory, and tub-storage costs.
 
 Validation:
 ```bash
 uv run --env-file .env python -m py_compile \
-  donkeydrone/drone_config_80mm.py donkeydrone/drone_config_65mm.py \
-  donkeydrone/drone_env.py donkeydrone/drone_gym.py \
-  donkeydrone/gz_camera_worker.py donkeydrone/torch_train.py \
-  donkeydrone/torch_model.py
+  nanopilot/drone_config_80mm.py nanopilot/drone_config_65mm.py \
+  nanopilot/drone_env.py nanopilot/drone_gym.py \
+  nanopilot/gz_camera_worker.py nanopilot/torch_train.py \
+  nanopilot/torch_model.py
 ```
 - Passed.
 
 Bounded training probe on old/local tub resized to 640:
 ```bash
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_12_26-05-16 \
-  --model=/private/tmp/donkeydrone_640_probe.pth \
+  --model=/private/tmp/nanopilot_640_probe.pth \
   --myconfig=drone_config_80mm.py \
   --max-epochs=1 --max-samples=60 --batch-size=16 --no-model-summary
 ```
@@ -1280,7 +1280,7 @@ uv run --env-file .env python donkeydrone/torch_train.py \
 Live headless collection check:
 ```bash
 GZ_HEADLESS=1 ./scripts/start.sh --no-manage --airframe=80mm
-GZ_WORLD=baylands_80mm uv run --env-file .env python donkeydrone/autonomous_collect.py \
+GZ_WORLD=baylands_80mm uv run --env-file .env python nanopilot/autonomous_collect.py \
   --airframe=80mm --duration=3 --warmup=1 --rate-hz=10 --ready-timeout=30
 bash ./scripts/stop_all.sh
 ```
@@ -1291,9 +1291,9 @@ bash ./scripts/stop_all.sh
 
 Bounded training probe on newly recorded 640 tub:
 ```bash
-uv run --env-file .env python donkeydrone/torch_train.py \
+uv run --env-file .env python nanopilot/torch_train.py \
   --tubs=data/tub_14_26-05-16 \
-  --model=/private/tmp/donkeydrone_tub14_640_probe.pth \
+  --model=/private/tmp/nanopilot_tub14_640_probe.pth \
   --myconfig=drone_config_80mm.py \
   --max-epochs=1 --max-samples=28 --batch-size=8 --no-model-summary
 ```

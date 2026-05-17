@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Standalone PyTorch training script for DonkeyDrone CNN.
+Standalone PyTorch training script for Nanopilot CNN.
 
 Reads tub data directly (catalog JSON + JPEG images), trains a PyTorch
 LinearModel, and saves the best checkpoint as a .pth file.
 
 Usage:
-    python donkeydrone/torch_train.py --tubs=data/tub_16_26-03-01 --model=models/pilot.pth
-    python donkeydrone/torch_train.py --tubs=data/tub_16_26-03-01,data/tub_17_26-03-01 --model=models/pilot.pth
+    python nanopilot/torch_train.py --tubs=data/tub_16_26-03-01 --model=models/pilot.pth
+    python nanopilot/torch_train.py --tubs=data/tub_16_26-03-01,data/tub_17_26-03-01 --model=models/pilot.pth
 
 Options:
     --tubs      Comma-separated list of tub directories
@@ -177,7 +177,7 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train PyTorch CNN for DonkeyDrone')
+    parser = argparse.ArgumentParser(description='Train PyTorch CNN for Nanopilot')
     parser.add_argument('--tubs', required=True, help='Comma-separated tub directories')
     parser.add_argument('--model', required=True, help='Output .pth model path')
     parser.add_argument('--myconfig', default='drone_config_65mm.py', help='Config file')

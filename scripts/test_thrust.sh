@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-command wrapper: bring up Gazebo + BetaFlight SITL (no drone_manage),
-# run donkeydrone/test_thrust.py, then tear down.
+# run nanopilot/test_thrust.py, then tear down.
 #
 # Usage:
 #     ./scripts/test_thrust.sh [--airframe=65mm|80mm] [test_thrust.py args...]
@@ -81,4 +81,4 @@ done
 
 echo "Running test_thrust.py..."
 cd "$PROJECT_DIR"
-uv run --env-file .env python donkeydrone/test_thrust.py ${TEST_ARGS[@]+"${TEST_ARGS[@]}"}
+uv run --env-file .env python nanopilot/test_thrust.py ${TEST_ARGS[@]+"${TEST_ARGS[@]}"}
