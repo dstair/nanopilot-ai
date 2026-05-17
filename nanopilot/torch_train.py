@@ -12,7 +12,7 @@ Usage:
 Options:
     --tubs      Comma-separated list of tub directories
     --model     Output .pth model path
-    --myconfig  Config file override [default: drone_config_65mm.py]
+    --myconfig  Config file override [default: drone_config_80mm.py]
 """
 
 import argparse
@@ -180,7 +180,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train PyTorch CNN for Nanopilot')
     parser.add_argument('--tubs', required=True, help='Comma-separated tub directories')
     parser.add_argument('--model', required=True, help='Output .pth model path')
-    parser.add_argument('--myconfig', default='drone_config_65mm.py', help='Config file')
+    parser.add_argument('--myconfig', default='drone_config_80mm.py', help='Config file')
     parser.add_argument('--max-epochs', type=int, default=None, help='Override MAX_EPOCHS')
     parser.add_argument('--max-samples', type=int, default=None, help='Use at most this many evenly spaced samples')
     parser.add_argument('--batch-size', type=int, default=None, help='Override BATCH_SIZE')

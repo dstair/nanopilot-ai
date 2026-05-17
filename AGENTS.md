@@ -229,9 +229,9 @@ Controlled by `DRONE_CAMERA_SOURCE` in your `nanopilot/drone_config_XXmm.py`:
 - `"gz_transport"` (default): native macOS, Gazebo Harmonic, gz-python bindings
 - `"rtsp"`: Docker legacy mode, Gazebo Classic, OpenCV VideoCapture
 
-## CNN Model (LinearModel)
+## Multi-modal Model (LinearModel)
 
-- Current model in `nanopilot/torch_model.py` uses a residual CNN image branch, GRU IMU branch, previous-control feedback branch, and multi-head attention fusion.
+- Current model in `nanopilot/torch_model.py` is an Attention-fused Residual CNN-GRU. It uses GELU activations for improved gradient flow.
 - Inputs: image `(B, 3, H, W)` float32 `[0,1]`, IMU sequence `(B, seq_len, 6)`, previous controls `(B, 4)`.
 - Output: `(B, 4)` for `[steering/yaw, throttle/pitch, roll, altitude]`.
 - Offline training/evaluation use `TubDataset`, which returns `(image, imu, prev_ctrl, target)`.

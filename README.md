@@ -1,20 +1,28 @@
-# Nanopilot: CNN-Based Autonomous Drone Flight
+# Nanopilot: Multi-modal Attention-fused Autonomous Drone Flight
 
-Fly a drone using the same workflow as DonkeyCar:
+Major thanks and credit to the DonkeyCar project as this was originally forked from DonkeyCar. 
 
-1. fly manually
-2. record data
-3. train a CNN
-4. fly autonomously
+The idea here is that you can train and run a Multi-modal Attention-fused Network that can fly a drone in minutes.
 
-This adapts DonkeyCar's pipeline to control a simulated drone in BetaFlight SITL (flight controller firmware) + Gazebo (simulator).
+1. Fly around manually; press the record button to keep training data.
+2. Train a CNN using that data. The output is an autopilot that flies like you.
+3. $un the same simulation using the 
 
-The CNN learns to control forward pitch, yaw rate, and motor throttle from camera
-images -- the same way DonkeyCar learns steering and throttle.
+This adapts DonkeyCar's implementation in a number of ways:
+- use BetaFlight Software in the Loop. This means you might be able to swap in a real BetaFlight drone (Hardware in the Loop), and use the same flow as above to build an autopilot for it.
+- use Gazebo for simulation. There are various adaptations for drone flight: drones move in 3D via pitch/yaw/roll, and throttle commands. This required a significant re-design of the controls.
+- The CNN is now updated to take control input data, and IMU data (basically movement data). This gives the model some key inputs for flight; the model still sees the image, but now knows if the user punches the throttle and tilts the drone forward aggressively.
+
+## Model updates
+
+Why the name Multi-modal Attention-fused Residual CNN-GRU? It captures the vision part (Residual CNN), the temporal IMU part (GRU), and the integration mechanism (Multi-head Attention).
+- IMU + GRU: This adds a temporal (Recurrent) dimension; it means the model has "memory." It doesn't just see a single frame; it understands the drone's inertia and momentum. Without this, a single blank frame result in the model giving nonsensical outputs; with it, the model can understand concepts like movement through space.
+- GELU (Gaussian Error Linear Unit): This is a modern activation function (used in GPT and BERT). It indicates that the model is using state-of-the-art stochastic regularity rather than the simpler, piecewise-linear ReLU.
+- Multi-head Attention: This transforms the model from a simple "concatenation" of inputs into a Transformer-hybrid.
 
 ## How It Works
 
-The drone uses the exact same DonkeyCar parts pipeline as a car:
+The drone uses the exact same pipeline as DonkeyCar:
 
 ```
 Web Controller  -->  DriveMode  -->  DroneGymEnv  -->  BetaFlight SITL + Gazebo
@@ -23,17 +31,18 @@ Web Controller  -->  DriveMode  -->  DroneGymEnv  -->  BetaFlight SITL + Gazebo
   altitude)                            UDP 9004)
 
 Camera frames  <--  DroneGymEnv  <--  Gazebo
- (320x240 RGB)      (gz-transport)    (renders scene)
+ (640x480 RGB)      (gz-transport)    (renders scene)
 ```
 
 Camera mode (set `DRONE_CAMERA_SOURCE` in your `nanopilot/drone_config_XXmm.py`):
 - **`gz_transport`** (default) — native macOS: Gazebo Harmonic publishes images
-  on a gz-transport topic. GPU-accelerated via Metal/OpenGL. Requires `gz-python`.
+  on a gz-transport topic. GPU-accelerated via Metal/OpenGL; this was key for performance.
 
-**Semantic mapping (BetaFlight Angle mode):**
-- `steering [-1, 1]` = yaw rate (turn left/right)
-- `throttle [-1, 1]` = forward pitch (tilt forward/backward)
-- `altitude [-1, 1]` = motor throttle (Arrow Up/Down keys). Direct power control — no PID, matching real BetaFlight behavior for CNN transferability.
+**Semantic mapping (DonkeyCar key name → Drone flight axis):**
+- `steering [-1, 1]` → **yaw** rate (turn left/right)
+- `throttle [-1, 1]` → **forward pitch** (tilt forward/backward)
+- `roll [-1, 1]`     → **lateral roll** (bank left/right)
+- `altitude [-1, 1]` → **motor throttle** (climb/descend). Direct power control — no PID, matching real BetaFlight behavior for CNN transferability.
 
 Since memory key names are identical to the car version, the web controller,
 CNN model (LinearModel), training pipeline, and data recording all work unchanged.
@@ -48,7 +57,7 @@ Side note: the setup was very intricate on macOS. I would recommend you use a co
 
 ## Native macOS Setup (GPU-Accelerated)
 
-Runs BetaFlight SITL and Gazebo Harmonic natively on Apple Silicon (ARM64). GPU rendering (not supported by Docker) was needed for acceptable performance.
+Runs BetaFlight SITL and Gazebo Harmonic natively on Apple Silicon (ARM64). GPU rendering (not supported by Docker) was needed for acceptable performance. Docker setup for Gazebo was much easier, but rendered aroune 1 FPS on a 2020 Macbook Air, and used ~500% CPU.
 
 ### Step 1: Install dependencies (one-time)
 
@@ -142,13 +151,12 @@ Then open http://127.0.0.1:8887
 
 **What `scripts/start.sh` does:**
 1. Launches Gazebo with the selected world
-2. Waits for the camera topic to appear
-3. Launches BetaFlight SITL
-4. Runs `nanopilot/drone_manage.py` which starts the Web UI and sends RC packets
-5. On exit or Ctrl+C, calls `scripts/stop_all.sh` to kill all processes cleanly
+2. Launches BetaFlight SITL
+3. Runs `nanopilot/drone_manage.py` which starts the Web UI and sends RC packets
+4. On exit or Ctrl+C, calls `scripts/stop_all.sh` to kill all processes cleanly
 
 **Environment variables** for customization:
-- `GZ_WORLD` — Gazebo world name (default: `baylands_80mm` for the default 80mm airframe)
+- `GZ_WORLD` — Gazebo world name. Default is `baylands_80mm`
 - `BETAFLIGHT_SITL_BIN` — path to BetaFlight SITL binary (default: `~/dev/betaflight/obj/main/betaflight_SITL.elf`)
 - `AEROLOOP_GAZEBO_DIR` — path to aeroloop_gazebo install (default: `~/dev/aeroloop_gazebo`)
 
@@ -158,23 +166,20 @@ Then open http://127.0.0.1:8887
 GZ_IP=127.0.0.1 gz sim -g &
 ```
 
-#### Stopping everything
-
-Ctrl+C in the `scripts/start.sh` terminal stops everything automatically. If processes are
-still running for any reason:
-
-```bash
-bash ./scripts/stop_all.sh
-```
-
 ---
 
-## Running the training pipeline
+## Run the training pipeline
 
-Once you have flown the drone for a bit, there will be a new "tub" in the `data/` folder. You can then use that data to train a CNN. Note, this could take a while. A "hello world" test on 300 images took 5 minutes on an M1 Mac:
+When you are ready to record training data, press "Start Recording" in the UI. Fly around to capture the outcome you are looking for. You have a few choices in the worlds/ folder. For example, if you want to train the drone to fly between trees, you can fly between trees in the baylands world. landing_target has a straight line you can fly along before landing. And slalom_gates provides gates for you to fly through.
+
+Once you have collected your training data,, there will be a new "tub" in the `data/` folder. You can then use that data to train an autopilot. Note, this could take a while depending on your input data size. A "hello world" test on 300 images took 5 minutes on an M1 Mac. Here's the command to train. Point it at an existing tub. The --model specifies the name of the model that will be chreated.
 
 ```bash
+# simpler command
 uv run python nanopilot/torch_train.py --tubs=data/tub_[number]_[yy-mm-dd] --model=models/pilot.pth
+
+# more complete command. PYTHONUNBUFFERED gives you more real time output to the logs.
+PYTHONUNBUFFERED=1 uv run --env-file .env python -u nanopilot/torch_train.py --tubs=data/tub_1_26-05-17 --model=models/tub_1_26-05-17.pth --myconfig=drone_config_80mm.py --max-epochs=10 --batch-size=16 --no-model-summary
 ```
 
 Once training completes, note the model output: models/pilot.pth. It is needed for next step.
@@ -184,16 +189,15 @@ If interested, you can optionally look at:
 - val_loss and when minimum loss occurred at.
 - number of samples in training and and validation datasets.
 
+## Flying with the trained autopilot
 
-## Testing the trained autopilot
-
-To test the autopilot model created in the previous step:
+To fly the autopilot model created in the previous step:
 
 ```bash
 ./scripts/start.sh --model=models/pilot.pth
 ```
 
-In the Web UI, switch to "local_angle" or "local" mode.
+In the Web UI, switch to "local_angle" or "local" mode. You can always switch back.
 
 ## Configuration
 
@@ -309,6 +313,8 @@ ARM64 Gazebo libraries.
 
 #### Resource utilization
 
+Depending on your system, you might need to adjust a few parameters to get acceptable performance.
+
 | Change | CPU Savings | Trade-off |
 |--------|-------------|-----------|
 | `DRIVE_LOOP_HZ = 10` | Less host-side work | Lower control rate |
@@ -399,16 +405,27 @@ X fix skating rink effect.
 X Angular drag: adding angular drag (e.g., velocity_decay <angular>) to the model.sdf or the BetaflightPlugin would contribute to more realistic rotational dynamics
 
 X Fix Yaw Speed.
+X 640x480
+
+
+
+- drone loses altitude slowly during forward flight, how to compensate??
+
+- increase horizontal damping to 0.35.
+
+- Surface more configs in the UI.
+  - max throttle range.
+  - max roll angle
+  - max pitch angle
+  - PWM adjustment factors
+
+
+- switch back to ArduPilot. Add LIDAR for ground detection, as well as optical flow for movement.
+
 
 - Consider More Advanced Drag Models (Future Work):
 For even greater physical accuracy, especially at higher speeds, you could explore implementing a quadratic drag model (F = -0.5 * rho * A * Cd * v^2) within the BetaflightPlugin. This would provide a more realistic non-linear relationship between speed and drag force.
 
-X 640x480
-
 - Add randomization of worlds (wall locations, colors) for better CNN training
 - Add looping to train model on a variety of worlds
 - research other tasks that would be interesting to implement (CNN to scan/build a 3D model of an object, for example)
-
-
-
-
