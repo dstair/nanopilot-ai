@@ -1368,3 +1368,44 @@ Implementation:
 - `nanopilot/drone_manage.py` stores a JSON-safe config snapshot on `LocalWebController` and sends it as `{"config": ...}` when a websocket client opens.
 - `nanopilot/templates/static/main.js` renders the config in a compact grid under the RC values.
 - The same `main.js` was synced to `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/main.js` for the runtime static path noted above.
+
+## Current Handoff (2026-05-17 quadratic horizontal drag)
+
+Implemented additive quadratic horizontal drag in the external aeroloop plugin:
+- `~/dev/aeroloop_gazebo/plugins/BetaflightPlugin.cc`
+- New SDF param: `<horizontalQuadraticDrag>`
+- Formula in `ApplyHorizontalVelocityDecay`: `F_xy = -m * (horizontalVelocityDecay + horizontalQuadraticDrag * |v_xy|) * v_xy`
+
+Updated both external model SDFs:
+- `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_65mm/model.sdf`
+- `~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`
+
+Both now set:
+- `<horizontalVelocityDecay>0.35</horizontalVelocityDecay>`
+- `<horizontalQuadraticDrag>0.05</horizontalQuadraticDrag>`
+- `<angularVelocityDecay>0.50</angularVelocityDecay>`
+
+Rebuilt the plugin:
+```bash
+cd ~/dev/aeroloop_gazebo/plugins/build
+make
+```
+
+Validation:
+```bash
+./scripts/test_thrust.sh --airframe=80mm --mode=lateral-coast \
+  --airborne-hover=1475 --airborne-climb=1500 --airborne-climb-s=1.5 \
+  --lateral-roll-pwm=1700 --lateral-accel-s=1.5 --lateral-coast-s=6
+```
+- Peak XY speed `2.466 m/s`, final `0.242 m/s` after `6.9s`, drift `6.297m`, half-life `2.23s`.
+- Note: the lateral-coast maneuver still climbed significantly in Z, so future work may need roll/pitch tilt throttle compensation similar to the pitch-forward feed-forward.
+
+Pitch-forward altitude compensation still passed after this change:
+```bash
+./scripts/test_thrust.sh --airframe=80mm --mode=damper-sim \
+  --airborne-hover=1475 --airborne-climb=1500 --airborne-climb-s=1.0 \
+  --damper-k=45 --damper-sample-s=8 \
+  --damper-pitch-after=3 --damper-pitch-pwm=1700 \
+  --damper-pitch-ff=8 --damper-pitch-cap=200
+```
+- Passed: after-settle drift `-0.097m`, `alt_p2p=0.124m`, `vz_mean=-0.012m/s`.

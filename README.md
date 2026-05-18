@@ -421,8 +421,8 @@ X Surface more configs in the UI.
 - switch back to ArduPilot. Add LIDAR for ground detection, as well as optical flow for movement.
 
 
-- Consider More Advanced Drag Models (Future Work):
-For even greater physical accuracy, especially at higher speeds, you could explore implementing a quadratic drag model (F = -0.5 * rho * A * Cd * v^2) within the BetaflightPlugin. This would provide a more realistic non-linear relationship between speed and drag force.
+X Consider More Advanced Drag Models:
+Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
 
 - Add randomization of worlds (wall locations, colors) for better CNN training
 - Add looping to train model on a variety of worlds

@@ -659,7 +659,43 @@ class DroneGymEnv:
         except Exception as e:
             logger.error("Reset pose error: %s", e)
 
-    def run_threaded(self, steering, throttle, roll, altitude, user_arm=None, user_reset=None):
+    def update_flight_config(self, config_update):
+        """Apply runtime-editable flight config values from the web UI."""
+        if not isinstance(config_update, dict):
+            return
+
+        changed = []
+        if "max_pitch_angle" in config_update:
+            value = float(config_update["max_pitch_angle"])
+            self.max_pitch_angle = max(1.0, min(80.0, value))
+            changed.append(f"max_pitch_angle={self.max_pitch_angle:.1f}")
+        if "max_roll_angle" in config_update:
+            value = float(config_update["max_roll_angle"])
+            self.max_roll_angle = max(1.0, min(80.0, value))
+            changed.append(f"max_roll_angle={self.max_roll_angle:.1f}")
+        if "max_yaw_rate" in config_update:
+            value = float(config_update["max_yaw_rate"])
+            self.max_yaw_rate = max(1.0, min(360.0, value))
+            self.yaw_pwm_cap = int(
+                max(0, min(500, round(self.max_yaw_rate / _YAW_DEG_PER_SEC_PER_PWM)))
+            )
+            changed.append(
+                f"max_yaw_rate={self.max_yaw_rate:.1f} yaw_pwm_cap={self.yaw_pwm_cap}"
+            )
+
+        if changed:
+            logger.info("Updated flight config: %s", ", ".join(changed))
+
+    def run_threaded(
+        self,
+        steering,
+        throttle,
+        roll,
+        altitude,
+        user_arm=None,
+        user_reset=None,
+        config_update=None,
+    ):
         """
         Called by the DonkeyCar Vehicle loop each frame.
 
@@ -670,8 +706,11 @@ class DroneGymEnv:
         :param user_arm: optional bool. None = legacy auto-arm; True/False =
                          explicit arm switch (e.g. Xbox RT deadman).
         :param user_reset: optional bool. True = one-shot pose reset from LT.
+        :param config_update: optional runtime flight config update from web UI.
         :return: camera image array + optional telemetry values
         """
+        self.update_flight_config(config_update)
+
         # Loop delay measurement
         if self.measure_loop_delay:
             now = time.time()

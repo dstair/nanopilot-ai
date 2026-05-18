@@ -191,6 +191,10 @@ var driveHandler = new function() {
         state.throttleMode = $(this).val();
       });
 
+      $('.drone-config-input').on('change', function () {
+        postConfigUpdate($(this).data('configKey'), $(this).val());
+      });
+
       $('#record_button').click(function () {
         toggleRecording();
       });
@@ -320,6 +324,12 @@ var driveHandler = new function() {
         + '.rc-config-grid { display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;font-size:12px; }'
         + '.rc-config-item { display:flex;justify-content:space-between;gap:8px;color:#aaa; }'
         + '.rc-config-item span { color:#f2f2f2; }'
+        + '.rc-config-edit { align-items:center; }'
+        + '.rc-config-input-wrap { display:flex;align-items:center;gap:3px;color:#f2f2f2; }'
+        + '.rc-config-input { width:68px;height:24px;padding:2px 5px;border-radius:4px;'
+        +   'border:1px solid rgba(255,255,255,.24);background:rgba(0,0,0,.22);'
+        +   'color:#fff;font-size:12px;text-align:right; }'
+        + '.rc-config-unit { min-width:22px;color:#bbb; }'
         + '@media (max-width: 700px) {'
         +   '.rc-header { align-items:flex-start;flex-direction:column; }'
         +   '.rc-status { width:100%; }'
@@ -374,12 +384,12 @@ var driveHandler = new function() {
         +   '<div class="rc-config">'
         +     '<div class="rc-config-title">Flight config</div>'
         +     '<div class="rc-config-grid">'
-        +       '<div class="rc-config-item">max pitch <span id="cfg-max-pitch">----</span></div>'
-        +       '<div class="rc-config-item">max roll <span id="cfg-max-roll">----</span></div>'
+        +       configInputHtml('max pitch', 'cfg-max-pitch', 'max_pitch_angle', '°', 1, 80, 1)
+        +       configInputHtml('max roll', 'cfg-max-roll', 'max_roll_angle', '°', 1, 80, 1)
+        +       configInputHtml('max yaw', 'cfg-max-yaw-rate', 'max_yaw_rate', '°/s', 1, 360, 5)
         +       '<div class="rc-config-item">hover PWM <span id="cfg-hover-throttle">----</span></div>'
         +       '<div class="rc-config-item">throttle range <span id="cfg-throttle-range">----</span></div>'
         +       '<div class="rc-config-item">input sensitivity <span id="cfg-input-sensitivity">----</span></div>'
-        +       '<div class="rc-config-item">max yaw rate <span id="cfg-max-yaw-rate">----</span></div>'
         +       '<div class="rc-config-item">yaw PWM cap <span id="cfg-yaw-pwm-cap">----</span></div>'
         +       '<div class="rc-config-item">yaw FF <span id="cfg-yaw-ff">----</span></div>'
         +       '<div class="rc-config-item">pitch FF <span id="cfg-pitch-ff">----</span></div>'
@@ -393,6 +403,19 @@ var driveHandler = new function() {
       } else {
         $('body').prepend(html);
       }
+    };
+
+    var configInputHtml = function(label, id, key, unit, min, max, step) {
+      return ''
+        + '<label class="rc-config-item rc-config-edit" for="' + id + '">'
+        +   '<span>' + label + '</span>'
+        +   '<span class="rc-config-input-wrap">'
+        +     '<input id="' + id + '" class="rc-config-input drone-config-input" '
+        +       'type="number" inputmode="decimal" min="' + min + '" max="' + max + '" '
+        +       'step="' + step + '" data-config-key="' + key + '">'
+        +     '<span class="rc-config-unit">' + unit + '</span>'
+        +   '</span>'
+        + '</label>';
     };
 
     var clamp = function(value, min, max) {
@@ -419,13 +442,20 @@ var driveHandler = new function() {
       return value + (suffix || '');
     };
 
+    var setConfigInput = function(selector, value) {
+      if (value === null || value === undefined || value === '') return;
+      var input = $(selector);
+      if (input.is(':focus')) return;
+      input.val(Math.round(parseFloat(value) * 100) / 100);
+    };
+
     var updateConfigUI = function() {
-      $('#cfg-max-pitch').text(fmtConfig(state.config.max_pitch_angle, '°'));
-      $('#cfg-max-roll').text(fmtConfig(state.config.max_roll_angle, '°'));
+      setConfigInput('#cfg-max-pitch', state.config.max_pitch_angle);
+      setConfigInput('#cfg-max-roll', state.config.max_roll_angle);
+      setConfigInput('#cfg-max-yaw-rate', state.config.max_yaw_rate);
       $('#cfg-hover-throttle').text(fmtConfig(state.config.hover_throttle));
       $('#cfg-throttle-range').text('±' + fmtConfig(state.config.throttle_range));
       $('#cfg-input-sensitivity').text(fmtConfig(state.config.input_sensitivity));
-      $('#cfg-max-yaw-rate').text(fmtConfig(state.config.max_yaw_rate, '°/s'));
       $('#cfg-yaw-pwm-cap').text(fmtConfig(state.config.yaw_pwm_cap));
       $('#cfg-yaw-ff').text(fmtConfig(state.config.yaw_throttle_feedforward, ' PWM'));
       $('#cfg-pitch-ff').text(fmtConfig(state.config.pitch_throttle_feedforward, ' PWM'));
@@ -595,6 +625,19 @@ var driveHandler = new function() {
             socket.send(json_data)
             updateUI()
         }
+    };
+
+    var postConfigUpdate = function(key, rawValue) {
+      if (!key) return;
+      var value = parseFloat(rawValue);
+      if (!isFinite(value)) {
+        updateConfigUI();
+        return;
+      }
+      var data = {'config': {}};
+      data.config[key] = value;
+      console.log(`Posting ${JSON.stringify(data)}`);
+      socket.send(JSON.stringify(data));
     };
 
     var applyDeadzone = function(number, threshold){

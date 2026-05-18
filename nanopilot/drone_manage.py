@@ -71,6 +71,7 @@ class LocalWebController(_LocalWebController):
         super().__init__(*args, **kwargs)
         self.roll = 0.0
         self._drone_config = {}
+        self._pending_drone_config_update = None
 
         import tornado.websocket
         from tornado.routing import URLSpec
@@ -99,6 +100,12 @@ class LocalWebController(_LocalWebController):
                     self.application.recording_latch = self.application.recording
                 if data.get("buttons") is not None:
                     latch_buttons(self.application.buttons, data["buttons"])
+                if data.get("config") is not None:
+                    update = self.application.update_drone_config(data["config"])
+                    if update:
+                        self.application.update_wsclients(
+                            {"config": self.application._drone_config}
+                        )
 
             def on_close(self):
                 logger.info("Client disconnected")
@@ -177,6 +184,35 @@ class LocalWebController(_LocalWebController):
             ),
         }
 
+    def update_drone_config(self, values):
+        allowed = {
+            "max_pitch_angle": (1.0, 80.0),
+            "max_roll_angle": (1.0, 80.0),
+            "max_yaw_rate": (1.0, 360.0),
+        }
+        update = {}
+        for key, bounds in allowed.items():
+            if key not in values:
+                continue
+            try:
+                value = float(values[key])
+            except (TypeError, ValueError):
+                continue
+            lo, hi = bounds
+            value = max(lo, min(hi, value))
+            self._drone_config[key] = value
+            update[key] = value
+
+        if update:
+            max_yaw_rate = self._drone_config.get("max_yaw_rate")
+            if max_yaw_rate is not None:
+                self._drone_config["yaw_pwm_cap"] = int(
+                    max(0, min(500, round(float(max_yaw_rate) / 0.30)))
+                )
+            self._pending_drone_config_update = update
+            logger.info("Queued runtime drone config update: %s", update)
+        return update
+
     def run_threaded(
         self,
         img_arr=None,
@@ -236,7 +272,9 @@ class LocalWebController(_LocalWebController):
             self.loop.add_callback(lambda: self.update_wsclients({"bf": bf_changes}))
 
         angle, throttle, altitude, mode, recording, buttons = result
-        return angle, throttle, self.roll, altitude, mode, recording, buttons
+        config_update = self._pending_drone_config_update
+        self._pending_drone_config_update = None
+        return angle, throttle, self.roll, altitude, mode, recording, buttons, config_update
 
     def run(self, *args, **kwargs):
         return self.run_threaded(*args, **kwargs)
@@ -266,7 +304,15 @@ def add_drone_sim(V, cfg):
     """
     gym = build_drone_env(cfg)
 
-    inputs = ["steering", "throttle", "roll", "altitude", "user/arm", "user/reset"]
+    inputs = [
+        "steering",
+        "throttle",
+        "roll",
+        "altitude",
+        "user/arm",
+        "user/reset",
+        "drone/config",
+    ]
     outputs = [
         "cam/image_array",
         "rc/roll",
@@ -938,6 +984,7 @@ def add_user_controller(V, cfg, use_joystick, use_xbox=False, input_image="ui/im
             "user/mode",
             "recording",
             "web/buttons",
+            "drone/config",
         ],
         threaded=True,
     )
