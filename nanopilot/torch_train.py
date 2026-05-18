@@ -57,7 +57,7 @@ def train(
     lr = getattr(cfg, 'LEARNING_RATE', 0.001)
     patience = getattr(cfg, 'EARLY_STOP_PATIENCE', 5)
     train_split = train_split_override or getattr(cfg, 'TRAIN_TEST_SPLIT', 0.8)
-    seq_len = getattr(cfg, 'SEQUENCE_LENGTH', 3)
+    seq_len = getattr(cfg, 'SEQUENCE_LENGTH', 7)
 
     # Define image transformations to match config resolution
     img_transform = transforms.Compose([
@@ -123,7 +123,14 @@ def train(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # HuberLoss is more robust to outliers than MSE, reducing "twitchy" flight
-    criterion = nn.HuberLoss(delta=1.0)
+    # We apply weights to the [yaw, pitch, roll, altitude] axes to prioritize height.
+    loss_weights = torch.tensor(getattr(cfg, 'TRAIN_LOSS_WEIGHTS', [1.0, 1.0, 1.2, 3.5]), device=device)
+
+    def criterion(pred, target):
+        # Calculate per-element Huber loss
+        loss = torch.nn.functional.huber_loss(pred, target, reduction='none', delta=1.0)
+        # Multiply by weights and return mean
+        return (loss * loss_weights).mean()
 
     # Training loop
     best_val_loss = float('inf')

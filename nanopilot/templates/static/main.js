@@ -49,7 +49,7 @@ var driveHandler = new function() {
         'pilot': 'None',
         'session': 'None',
         'lag': 0,
-        'controlMode': 'joystick',
+        'controlMode': 'keyboard',
         'maxThrottle' : 1,
         'throttleMode' : 'user',
         'buttons': {
@@ -79,6 +79,7 @@ var driveHandler = new function() {
 
       applyDroneTheme()
       injectRcPanel()
+      applyDroneLayout()
       setBindings()
 
       joystick_element = document.getElementById('joystick_container');
@@ -101,12 +102,10 @@ var driveHandler = new function() {
 
       if (window.DeviceOrientationEvent) {
         window.addEventListener("deviceorientation", handleOrientation);
-        console.log("Browser supports device orientation, setting control mode to tilt.");
-        state.controlMode = 'tilt';
+        console.log("Browser supports device orientation.");
         deviceOrientationLoop();
       } else {
-        console.log("Device Orientation not supported by browser, setting control mode to joystick.");
-        state.controlMode = 'joystick';
+        console.log("Device Orientation not supported by browser.");
       }
     };
 
@@ -195,6 +194,24 @@ var driveHandler = new function() {
         postConfigUpdate($(this).data('configKey'), $(this).val());
       });
 
+      $('#drone-reset-button').click(function () {
+        postReset();
+      });
+
+      $('.drone-control-mode').click(function () {
+        setControlMode($(this).data('controlMode'));
+      });
+
+      $('#drone-throttle-mode').on('change', function () {
+        state.throttleMode = $(this).val();
+        $('#throttle_mode_select').val(state.throttleMode);
+      });
+
+      $('#drone-max-throttle').on('change', function () {
+        state.maxThrottle = parseFloat($(this).val());
+        $('#max_throttle_select').val(state.maxThrottle);
+      });
+
       $('#record_button').click(function () {
         toggleRecording();
       });
@@ -205,17 +222,12 @@ var driveHandler = new function() {
 
       $('input[type=radio][name=controlMode]').change(function() {
         if (this.value == 'joystick') {
-          state.controlMode = "joystick";
+          state.controlMode = "keyboard";
           joystickLoopRunning = true;
-          console.log('joystick mode');
+          console.log('keyboard mode');
           joystickLoop();
         } else {
           joystickLoopRunning = false;
-        }
-
-        if (deviceHasOrientation && this.value == 'tilt') {
-          state.controlMode = "tilt";
-          console.log('tilt mode')
         }
 
         if (hasGamepad && this.value == 'gamepad') {
@@ -237,6 +249,11 @@ var driveHandler = new function() {
         state.buttons[$(this).attr('id')] = false;
         postDrive(["buttons"]); // write it back to the server
       });
+    };
+
+    var applyDroneLayout = function() {
+      $('#joystick-column, #joystick-padding, #joystick_outer').hide();
+      $('#joystick-column').prev('.col-md-6').addClass('drone-main-column');
     };
 
 
@@ -277,29 +294,42 @@ var driveHandler = new function() {
         + '.container, .container-fluid, .row, #content, #main, #drive, #control-bars {'
         +   'background:#000 !important;'
         + '}'
+        + '.container { width:100% !important;max-width:none !important;padding-left:14px;padding-right:14px; }'
+        + '#joystick-column, #joystick-padding, #joystick_outer { display:none !important; }'
+        + '.drone-main-column { width:100% !important;float:none !important; }'
+        + '.drone-main-column form:first-child { display:flex;align-items:center;gap:8px;flex-wrap:wrap; }'
+        + '.drone-main-column .thumbnail { max-width:1120px;background:#080808;border-color:#222;'
+        +   'border-radius:4px;padding:6px;margin:0 auto; }'
+        + '#mpeg-image { width:100%;max-height:calc(100vh - 360px);object-fit:contain;margin:0 auto; }'
+        + '#button_bar { display:none !important; }'
         + 'label, .control-label, .form-check-label { color:#eee !important; }'
         + 'a { color:#8ab4ff; }'
         + '#control-bars { display:none !important; }'
-        + '#rc-panel { margin-top:10px;padding:14px;background:#202020;color:#eee;'
+        + '#rc-panel { max-width:1120px;margin:10px auto 0;padding:14px;background:#202020;color:#eee;'
         +   'border-radius:4px;font-family:Menlo,Consolas,monospace;'
         +   'box-shadow:inset 0 0 0 1px rgba(255,255,255,.08); }'
         + '#rc-panel * { box-sizing:border-box; }'
         + '.rc-header { display:flex;align-items:center;justify-content:space-between;gap:12px;'
         +   'padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.10); }'
         + '.rc-source { color:#f0f0f0;font-size:18px;font-weight:700; }'
+        + '.rc-header-actions { display:flex;align-items:center;gap:8px; }'
         + '.rc-status { min-width:118px;text-align:center;padding:5px 10px;border-radius:4px;'
         +   'font-size:18px;font-weight:800;letter-spacing:.04em; }'
         + '.rc-status.armed { background:#471b1b;color:#ff8a8a;box-shadow:inset 0 0 0 1px #cf5555; }'
         + '.rc-status.disarmed { background:#18281f;color:#78e5a0;box-shadow:inset 0 0 0 1px #3c8f58; }'
+        + '.rc-action-button { height:29px;padding:3px 8px;border:1px solid rgba(255,255,255,.24);'
+        +   'border-radius:4px;background:rgba(255,255,255,.08);color:#fff;font-size:12px;'
+        +   'line-height:18px; }'
+        + '.rc-action-button:hover { background:rgba(255,255,255,.15); }'
         + '.rc-meta { display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0 12px;'
         +   'font-size:13px;color:#ccc; }'
         + '.rc-meta span { color:#fff; }'
-        + '.rc-sticks { display:grid;grid-template-columns:1fr 1fr;gap:12px; }'
-        + '.rc-stick-card { min-width:0; }'
+        + '.rc-sticks { display:grid;grid-template-columns:repeat(2, 164px);gap:12px;justify-content:start; }'
+        + '.rc-stick-card { width:164px;min-width:0; }'
         + '.rc-stick-title { display:flex;justify-content:space-between;gap:8px;margin-bottom:6px;'
         +   'font-size:13px;color:#ddd; }'
         + '.rc-stick-title strong { color:#fff; }'
-        + '.rc-stick { position:relative;width:100%;aspect-ratio:1 / 1;min-height:142px;'
+        + '.rc-stick { position:relative;width:164px;height:164px;'
         +   'border-radius:4px;background:#101010;overflow:hidden;'
         +   'box-shadow:inset 0 0 0 1px rgba(255,255,255,.16); }'
         + '.rc-stick:before, .rc-stick:after { content:"";position:absolute;background:rgba(255,255,255,.16); }'
@@ -324,6 +354,13 @@ var driveHandler = new function() {
         + '.rc-config-grid { display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;font-size:12px; }'
         + '.rc-config-item { display:flex;justify-content:space-between;gap:8px;color:#aaa; }'
         + '.rc-config-item span { color:#f2f2f2; }'
+        + '.rc-config-control { align-items:center; }'
+        + '.rc-config-control select { height:24px;padding:2px 5px;border-radius:4px;'
+        +   'border:1px solid rgba(255,255,255,.24);background:#111;color:#fff;font-size:12px; }'
+        + '.rc-segment { display:flex;gap:4px; }'
+        + '.rc-segment-button { height:24px;padding:2px 8px;border:1px solid rgba(255,255,255,.24);'
+        +   'border-radius:4px;background:rgba(255,255,255,.08);color:#ddd;font-size:12px; }'
+        + '.rc-segment-button.active { background:#2d5d42;color:#fff;border-color:#56ad76; }'
         + '.rc-config-edit { align-items:center; }'
         + '.rc-config-input-wrap { display:flex;align-items:center;gap:3px;color:#f2f2f2; }'
         + '.rc-config-input { width:68px;height:24px;padding:2px 5px;border-radius:4px;'
@@ -334,6 +371,9 @@ var driveHandler = new function() {
         +   '.rc-header { align-items:flex-start;flex-direction:column; }'
         +   '.rc-status { width:100%; }'
         +   '.rc-meta, .rc-sticks, .rc-values, .rc-config-grid { grid-template-columns:1fr; }'
+        +   '.rc-sticks { justify-content:stretch; }'
+        +   '.rc-stick-card, .rc-stick { width:100%; }'
+        +   '.rc-stick { height:auto;aspect-ratio:1 / 1; }'
         + '}';
       $('head').append('<style id="nanopilot-theme">' + css + '</style>');
     };
@@ -344,7 +384,10 @@ var driveHandler = new function() {
         + '<div id="rc-panel">'
         +   '<div class="rc-header">'
         +     '<div class="rc-source">BetaFlight</div>'
-        +     '<div id="bf-status" class="rc-status disarmed">DISARMED</div>'
+        +     '<div class="rc-header-actions">'
+        +       '<button id="drone-reset-button" type="button" class="rc-action-button">Reset</button>'
+        +       '<div id="bf-status" class="rc-status disarmed">DISARMED</div>'
+        +     '</div>'
         +   '</div>'
         +   '<div class="rc-meta">'
         +     '<div>active modes: <span id="bf-active-modes">----</span></div>'
@@ -384,6 +427,19 @@ var driveHandler = new function() {
         +   '<div class="rc-config">'
         +     '<div class="rc-config-title">Flight config</div>'
         +     '<div class="rc-config-grid">'
+        +       '<div class="rc-config-item rc-config-control">input <span class="rc-segment">'
+        +         '<button type="button" class="rc-segment-button drone-control-mode" data-control-mode="keyboard">Keyboard</button>'
+        +         '<button type="button" class="rc-segment-button drone-control-mode" data-control-mode="gamepad">Controller</button>'
+        +       '</span></div>'
+        +       '<div class="rc-config-item rc-config-control">throttle <span>'
+        +         '<select id="drone-throttle-mode">'
+        +           '<option value="user">Maximum</option>'
+        +           '<option value="constant">Constant</option>'
+        +         '</select> '
+        +         '<select id="drone-max-throttle">'
+        +           throttleOptionHtml()
+        +         '</select>'
+        +       '</span></div>'
         +       configInputHtml('max pitch', 'cfg-max-pitch', 'max_pitch_angle', '°', 1, 80, 1)
         +       configInputHtml('max roll', 'cfg-max-roll', 'max_roll_angle', '°', 1, 80, 1)
         +       configInputHtml('max yaw', 'cfg-max-yaw-rate', 'max_yaw_rate', '°/s', 1, 360, 5)
@@ -403,6 +459,12 @@ var driveHandler = new function() {
       } else {
         $('body').prepend(html);
       }
+    };
+
+    var throttleOptionHtml = function() {
+      return [100, 95, 90, 85, 80, 75, 70, 60, 50, 40, 30, 20, 10].map(function(t) {
+        return '<option value="' + (t / 100.0) + '">' + t + '%</option>';
+      }).join('');
     };
 
     var configInputHtml = function(label, id, key, unit, min, max, step) {
@@ -462,6 +524,15 @@ var driveHandler = new function() {
       $('#cfg-alt-hold-k').text(fmtConfig(state.config.altitude_hold_k, ' PWM/(m/s)'));
     };
 
+    var updateDroneControlUI = function() {
+      $('.drone-control-mode')
+        .removeClass('active')
+        .filter('[data-control-mode="' + state.controlMode + '"]')
+        .addClass('active');
+      $('#drone-throttle-mode').val(state.throttleMode);
+      $('#drone-max-throttle').val(state.maxThrottle);
+    };
+
     var updateRcUI = function() {
       $('#rc-roll').text(state.rc.roll);
       $('#rc-pitch').text(state.rc.pitch);
@@ -497,6 +568,7 @@ var driveHandler = new function() {
       $("#throttleInput").val(state.tele.user.throttle);
       $("#angleInput").val(state.tele.user.angle);
       $('#mode_select').val(state.driveMode);
+      updateDroneControlUI();
       updateRcUI();
 
       var throttlePercent = Math.round(Math.abs(state.tele.user.throttle) * 100) + '%';
@@ -557,14 +629,6 @@ var driveHandler = new function() {
           .addClass('btn-danger').end()
       }
 
-      if(deviceHasOrientation) {
-        $('#tilt-toggle').removeAttr("disabled")
-        $('#tilt').removeAttr("disabled")
-      } else {
-        $('#tilt-toggle').attr("disabled", "disabled");
-        $('#tilt').prop("disabled", true);
-      }
-
       if(hasGamepad) {
         $('#gamepad-toggle').removeAttr("disabled")
         $('#gamepad').removeAttr("disabled")
@@ -573,22 +637,14 @@ var driveHandler = new function() {
         $('#gamepad').prop("disabled", true);
       }
 
-      if (state.controlMode == "joystick") {
-        $('#joystick_outer').show();
+      if (state.controlMode == "keyboard") {
+        $('#joystick_outer').hide();
         $('#joystick-toggle').addClass("active");
         $('#joystick').attr("checked", "checked")
       } else {
         $('#joystick_outer').hide();
         $('#joystick-toggle').removeClass("active");
         $('#joystick').removeAttr("checked");
-      }
-
-      if (state.controlMode == "tilt") {
-        $('#tilt-toggle').addClass("active");
-        $('#tilt').attr("checked", "checked");
-      } else {
-        $('#tilt-toggle').removeClass("active");
-        $('#tilt').removeAttr("checked")
       }
 
       //drawLine(state.tele.user.angle, state.tele.user.throttle)
@@ -638,6 +694,21 @@ var driveHandler = new function() {
       data.config[key] = value;
       console.log(`Posting ${JSON.stringify(data)}`);
       socket.send(JSON.stringify(data));
+    };
+
+    var postReset = function() {
+      var data = {'reset': true};
+      console.log(`Posting ${JSON.stringify(data)}`);
+      socket.send(JSON.stringify(data));
+    };
+
+    var setControlMode = function(mode) {
+      if (mode != 'keyboard' && mode != 'gamepad') return;
+      state.controlMode = mode;
+      if (mode == 'gamepad') {
+        gamePadLoop();
+      }
+      updateDroneControlUI();
     };
 
     var applyDeadzone = function(number, threshold){
@@ -718,7 +789,7 @@ var driveHandler = new function() {
        setTimeout(function () {
             postDrive()
 
-          if (joystickLoopRunning && state.controlMode == "joystick") {
+          if (joystickLoopRunning && state.controlMode == "keyboard") {
              joystickLoop();
           }
        }, 100)
@@ -733,7 +804,7 @@ var driveHandler = new function() {
 
       if (beta == null || gamma == null) {
         deviceHasOrientation = false;
-        state.controlMode = "joystick";
+        state.controlMode = "keyboard";
         console.log("Invalid device orientation values, switched to joystick mode.")
       } else {
         deviceHasOrientation = true;

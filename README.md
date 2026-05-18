@@ -418,11 +418,14 @@ X Surface more configs in the UI.
   X PWM adjustment factors
 
 
+X Consider More Advanced Drag Models:
+Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
+
+
+
 - switch back to ArduPilot. Add LIDAR for ground detection, as well as optical flow for movement.
 
 
-X Consider More Advanced Drag Models:
-Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
 
 - Add randomization of worlds (wall locations, colors) for better CNN training
 - Add looping to train model on a variety of worlds

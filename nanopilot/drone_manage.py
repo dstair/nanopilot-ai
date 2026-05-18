@@ -72,6 +72,7 @@ class LocalWebController(_LocalWebController):
         self.roll = 0.0
         self._drone_config = {}
         self._pending_drone_config_update = None
+        self._pending_reset = False
 
         import tornado.websocket
         from tornado.routing import URLSpec
@@ -100,6 +101,8 @@ class LocalWebController(_LocalWebController):
                     self.application.recording_latch = self.application.recording
                 if data.get("buttons") is not None:
                     latch_buttons(self.application.buttons, data["buttons"])
+                if data.get("reset") is True:
+                    self.application._pending_reset = True
                 if data.get("config") is not None:
                     update = self.application.update_drone_config(data["config"])
                     if update:
@@ -274,7 +277,9 @@ class LocalWebController(_LocalWebController):
         angle, throttle, altitude, mode, recording, buttons = result
         config_update = self._pending_drone_config_update
         self._pending_drone_config_update = None
-        return angle, throttle, self.roll, altitude, mode, recording, buttons, config_update
+        reset = self._pending_reset
+        self._pending_reset = False
+        return angle, throttle, self.roll, altitude, mode, recording, buttons, reset, config_update
 
     def run(self, *args, **kwargs):
         return self.run_threaded(*args, **kwargs)
@@ -311,6 +316,7 @@ def add_drone_sim(V, cfg):
         "altitude",
         "user/arm",
         "user/reset",
+        "web/reset",
         "drone/config",
     ]
     outputs = [
@@ -984,6 +990,7 @@ def add_user_controller(V, cfg, use_joystick, use_xbox=False, input_image="ui/im
             "user/mode",
             "recording",
             "web/buttons",
+            "web/reset",
             "drone/config",
         ],
         threaded=True,

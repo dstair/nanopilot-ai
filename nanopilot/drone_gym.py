@@ -694,6 +694,7 @@ class DroneGymEnv:
         altitude,
         user_arm=None,
         user_reset=None,
+        web_reset=None,
         config_update=None,
     ):
         """
@@ -706,6 +707,7 @@ class DroneGymEnv:
         :param user_arm: optional bool. None = legacy auto-arm; True/False =
                          explicit arm switch (e.g. Xbox RT deadman).
         :param user_reset: optional bool. True = one-shot pose reset from LT.
+        :param web_reset: optional bool. True = one-shot pose reset from web UI.
         :param config_update: optional runtime flight config update from web UI.
         :return: camera image array + optional telemetry values
         """
@@ -752,7 +754,7 @@ class DroneGymEnv:
         self._prev_user_arm = self.user_arm
 
         # One-shot reset from Xbox LT (handled in background loop).
-        if user_reset is True:
+        if user_reset is True or web_reset is True:
             self._reset_requested = True
 
         # Read camera frame
