@@ -70,6 +70,7 @@ class LocalWebController(_LocalWebController):
 
         super().__init__(*args, **kwargs)
         self.roll = 0.0
+        self._drone_config = {}
 
         import tornado.websocket
         from tornado.routing import URLSpec
@@ -81,6 +82,8 @@ class LocalWebController(_LocalWebController):
             def open(self):
                 logger.info("New client connected")
                 self.application.wsclients.append(self)
+                if self.application._drone_config:
+                    self.write_message(json.dumps({"config": self.application._drone_config}))
 
             def on_message(self, message):
                 data = json.loads(message)
@@ -145,6 +148,33 @@ class LocalWebController(_LocalWebController):
             "arming_flags": None,
             "arming_disable_flags": None,
             "active_modes": None,
+        }
+
+    def set_drone_config(self, cfg):
+        self._drone_config = {
+            "max_pitch_angle": float(getattr(cfg, "DRONE_MAX_PITCH_ANGLE", 25.0)),
+            "max_roll_angle": float(
+                getattr(
+                    cfg,
+                    "DRONE_MAX_ROLL_ANGLE",
+                    getattr(cfg, "DRONE_MAX_PITCH_ANGLE", 25.0),
+                )
+            ),
+            "hover_throttle": int(getattr(cfg, "DRONE_HOVER_THROTTLE", 1500)),
+            "throttle_range": int(getattr(cfg, "DRONE_THROTTLE_RANGE", 300)),
+            "input_sensitivity": float(getattr(cfg, "DRONE_INPUT_SENSITIVITY", 1.0)),
+            "max_yaw_rate": float(getattr(cfg, "DRONE_MAX_YAW_RATE", 90.0)),
+            "yaw_pwm_cap": getattr(cfg, "DRONE_YAW_PWM_CAP", None),
+            "yaw_throttle_feedforward": float(
+                getattr(cfg, "DRONE_YAW_THROTTLE_FEEDFORWARD", 0.0)
+            ),
+            "pitch_throttle_feedforward": float(
+                getattr(cfg, "DRONE_PITCH_THROTTLE_FEEDFORWARD", 0.0)
+            ),
+            "altitude_hold_k": float(getattr(cfg, "DRONE_ALTITUDE_HOLD_K", 30.0)),
+            "altitude_hold_deadband": float(
+                getattr(cfg, "DRONE_ALTITUDE_HOLD_DEADBAND", 0.05)
+            ),
         }
 
     def run_threaded(
@@ -881,6 +911,7 @@ def add_camera(V, cfg, camera_type):
 
 def add_user_controller(V, cfg, use_joystick, use_xbox=False, input_image="ui/image_array"):
     ctr = LocalWebController(port=cfg.WEB_CONTROL_PORT, mode=cfg.WEB_INIT_MODE)
+    ctr.set_drone_config(cfg)
     V.add(
         ctr,
         inputs=[

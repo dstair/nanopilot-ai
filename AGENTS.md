@@ -1349,3 +1349,22 @@ Validation:
 ```
 - Passed: after-settle drift `-0.106m`, `alt_p2p=0.130m`, `vz_mean=-0.013m/s`, `ch3_mean=1481.0`.
 - Trial value `25` was too high and caused a strong climb, so keep `8.0` unless retuning for a different pitch sensitivity or airframe.
+
+## Current Handoff (2026-05-17 web config display)
+
+Surfaced read-only flight config values in the web UI BetaFlight panel:
+- max pitch angle
+- max roll angle
+- hover PWM
+- throttle range
+- input sensitivity
+- max yaw rate
+- yaw PWM cap
+- yaw throttle feed-forward
+- pitch throttle feed-forward
+- altitude hold K
+
+Implementation:
+- `nanopilot/drone_manage.py` stores a JSON-safe config snapshot on `LocalWebController` and sends it as `{"config": ...}` when a websocket client opens.
+- `nanopilot/templates/static/main.js` renders the config in a compact grid under the RC values.
+- The same `main.js` was synced to `~/dev/donkeycar-fork/donkeycar/parts/web_controller/templates/static/main.js` for the runtime static path noted above.

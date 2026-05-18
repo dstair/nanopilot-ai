@@ -30,6 +30,19 @@ var driveHandler = new function() {
             'arming_disable_flags': '',
             'active_modes': '',
         },
+        'config': {
+            'max_pitch_angle': null,
+            'max_roll_angle': null,
+            'hover_throttle': null,
+            'throttle_range': null,
+            'input_sensitivity': null,
+            'max_yaw_rate': null,
+            'yaw_pwm_cap': null,
+            'yaw_throttle_feedforward': null,
+            'pitch_throttle_feedforward': null,
+            'altitude_hold_k': null,
+            'altitude_hold_deadband': null,
+        },
         'brakeOn': true,
         'recording': false,
         'driveMode': "user",
@@ -302,10 +315,15 @@ var driveHandler = new function() {
         +   'font-size:13px; }'
         + '.rc-value { display:flex;justify-content:space-between;gap:8px;color:#bbb; }'
         + '.rc-value span { color:#fff; }'
+        + '.rc-config { margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,.10); }'
+        + '.rc-config-title { color:#fff;font-size:13px;font-weight:700;margin-bottom:6px; }'
+        + '.rc-config-grid { display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;font-size:12px; }'
+        + '.rc-config-item { display:flex;justify-content:space-between;gap:8px;color:#aaa; }'
+        + '.rc-config-item span { color:#f2f2f2; }'
         + '@media (max-width: 700px) {'
         +   '.rc-header { align-items:flex-start;flex-direction:column; }'
         +   '.rc-status { width:100%; }'
-        +   '.rc-meta, .rc-sticks, .rc-values { grid-template-columns:1fr; }'
+        +   '.rc-meta, .rc-sticks, .rc-values, .rc-config-grid { grid-template-columns:1fr; }'
         + '}';
       $('head').append('<style id="nanopilot-theme">' + css + '</style>');
     };
@@ -353,6 +371,21 @@ var driveHandler = new function() {
         +     '<div class="rc-value">arm aux <span id="rc-arm">----</span></div>'
         +     '<div class="rc-value">mode aux <span id="rc-mode">----</span></div>'
         +   '</div>'
+        +   '<div class="rc-config">'
+        +     '<div class="rc-config-title">Flight config</div>'
+        +     '<div class="rc-config-grid">'
+        +       '<div class="rc-config-item">max pitch <span id="cfg-max-pitch">----</span></div>'
+        +       '<div class="rc-config-item">max roll <span id="cfg-max-roll">----</span></div>'
+        +       '<div class="rc-config-item">hover PWM <span id="cfg-hover-throttle">----</span></div>'
+        +       '<div class="rc-config-item">throttle range <span id="cfg-throttle-range">----</span></div>'
+        +       '<div class="rc-config-item">input sensitivity <span id="cfg-input-sensitivity">----</span></div>'
+        +       '<div class="rc-config-item">max yaw rate <span id="cfg-max-yaw-rate">----</span></div>'
+        +       '<div class="rc-config-item">yaw PWM cap <span id="cfg-yaw-pwm-cap">----</span></div>'
+        +       '<div class="rc-config-item">yaw FF <span id="cfg-yaw-ff">----</span></div>'
+        +       '<div class="rc-config-item">pitch FF <span id="cfg-pitch-ff">----</span></div>'
+        +       '<div class="rc-config-item">alt hold K <span id="cfg-alt-hold-k">----</span></div>'
+        +     '</div>'
+        +   '</div>'
         + '</div>';
       var anchor = $('#control-bars');
       if (anchor.length) {
@@ -375,6 +408,28 @@ var driveHandler = new function() {
         left: ((x + 1) * 50) + '%',
         top: ((1 - (y + 1) / 2) * 100) + '%',
       });
+    };
+
+    var fmtConfig = function(value, suffix) {
+      if (value === null || value === undefined || value === '') return '----';
+      if (typeof value === 'number') {
+        var rounded = Math.round(value * 100) / 100;
+        return rounded + (suffix || '');
+      }
+      return value + (suffix || '');
+    };
+
+    var updateConfigUI = function() {
+      $('#cfg-max-pitch').text(fmtConfig(state.config.max_pitch_angle, '°'));
+      $('#cfg-max-roll').text(fmtConfig(state.config.max_roll_angle, '°'));
+      $('#cfg-hover-throttle').text(fmtConfig(state.config.hover_throttle));
+      $('#cfg-throttle-range').text('±' + fmtConfig(state.config.throttle_range));
+      $('#cfg-input-sensitivity').text(fmtConfig(state.config.input_sensitivity));
+      $('#cfg-max-yaw-rate').text(fmtConfig(state.config.max_yaw_rate, '°/s'));
+      $('#cfg-yaw-pwm-cap').text(fmtConfig(state.config.yaw_pwm_cap));
+      $('#cfg-yaw-ff').text(fmtConfig(state.config.yaw_throttle_feedforward, ' PWM'));
+      $('#cfg-pitch-ff').text(fmtConfig(state.config.pitch_throttle_feedforward, ' PWM'));
+      $('#cfg-alt-hold-k').text(fmtConfig(state.config.altitude_hold_k, ' PWM/(m/s)'));
     };
 
     var updateRcUI = function() {
@@ -405,6 +460,7 @@ var driveHandler = new function() {
       updateStick('#rc-left-dot', yaw, (throttle * 2) - 1);
       updateStick('#rc-right-dot', roll, pitch);
       $('#rc-throttle-fill').css('height', (throttle * 100) + '%');
+      updateConfigUI();
     };
 
     var updateUI = function() {

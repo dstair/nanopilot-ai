@@ -411,11 +411,11 @@ X drone loses altitude slowly during forward flight, how to compensate??
 
 X increase horizontal damping to 0.35.
 
-- Surface more configs in the UI.
-  - max throttle range.
-  - max roll angle
-  - max pitch angle
-  - PWM adjustment factors
+X Surface more configs in the UI.
+  X max throttle range.
+  X max roll angle
+  X max pitch angle
+  X PWM adjustment factors
 
 
 - switch back to ArduPilot. Add LIDAR for ground detection, as well as optical flow for movement.
