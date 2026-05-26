@@ -179,7 +179,7 @@ Once you have collected your training data,, there will be a new "tub" in the `d
 uv run python nanopilot/torch_train.py --tubs=data/tub_[number]_[yy-mm-dd] --model=models/pilot.pth
 
 # more complete command. PYTHONUNBUFFERED gives you more real time output to the logs.
-PYTHONUNBUFFERED=1 uv run --env-file .env python -u nanopilot/torch_train.py --tubs=data/tub_1_26-05-17 --model=models/tub_1_26-05-17.pth --myconfig=drone_config_80mm.py --max-epochs=10 --batch-size=16 --no-model-summary
+PYTHONUNBUFFERED=1 uv run --env-file .env python -u nanopilot/torch_train.py --tubs=data/tub_10_26-05-25 --model=models/tub_10_26-05-25.pth --myconfig=drone_config_80mm.py --max-epochs=15 --batch-size=16 --no-model-summary
 ```
 
 Once training completes, note the model output: models/pilot.pth. It is needed for next step.
@@ -194,7 +194,7 @@ If interested, you can optionally look at:
 To fly the autopilot model created in the previous step:
 
 ```bash
-./scripts/start.sh --model=models/pilot.pth
+./scripts/start.sh --model=models/tub_10_26-05-25.pth
 ```
 
 In the Web UI, switch to "local_angle" or "local" mode. You can always switch back.
@@ -274,7 +274,7 @@ All these .sdf files are in the worlds/ folder. They are provided to allow the C
 - drone_course_80mm
 - drone_course_65mm: retained Air65 course world
 
-GZ_WORLD=forest_80mm ./scripts/start.sh
+GZ_WORLD=slalom_gates_80mm ./scripts/start.sh
 
 
 ## Troubleshooting
@@ -422,11 +422,21 @@ X Consider More Advanced Drag Models:
 Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
 
 
+X Refine model flight characteristics. At some point it still crashes in to the ground. If no road is visible it gets stuck flying in circles.
 
+- try something simpler like just flying through gates? That seems like a better initial pass.
+
+X UI - boxes are a bit small at 164 pixels. Double the size. Also put one on left hand side, one on right hand side for better aesthetics.
+X UI - some components like input sensitivity just show --; remove them or fix them.
+
+- do I have flipped axes again? I thought I fixed the 90 degree thing???
+
+- Ask Gemini - the results are kind of bad, what to do? Switch to Ardupilot??
+
+
+## LONG TERM:
 - switch back to ArduPilot. Add LIDAR for ground detection, as well as optical flow for movement.
-
-
-
+- maybe look at implementing a VLM model??
 - Add randomization of worlds (wall locations, colors) for better CNN training
-- Add looping to train model on a variety of worlds
 - research other tasks that would be interesting to implement (CNN to scan/build a 3D model of an object, for example)
+

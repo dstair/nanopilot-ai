@@ -70,6 +70,7 @@ class LocalWebController(_LocalWebController):
 
         super().__init__(*args, **kwargs)
         self.roll = 0.0
+        self.altitude = 0.0
         self._drone_config = {}
         self._pending_drone_config_update = None
         self._pending_reset = False
@@ -161,6 +162,11 @@ class LocalWebController(_LocalWebController):
         }
 
     def set_drone_config(self, cfg):
+        max_yaw_rate = float(getattr(cfg, "DRONE_MAX_YAW_RATE", 90.0))
+        yaw_pwm_cap = getattr(cfg, "DRONE_YAW_PWM_CAP", None)
+        if yaw_pwm_cap is None:
+            yaw_pwm_cap = int(max(0, min(500, round(max_yaw_rate / 0.30))))
+
         self._drone_config = {
             "max_pitch_angle": float(getattr(cfg, "DRONE_MAX_PITCH_ANGLE", 25.0)),
             "max_roll_angle": float(
@@ -173,8 +179,8 @@ class LocalWebController(_LocalWebController):
             "hover_throttle": int(getattr(cfg, "DRONE_HOVER_THROTTLE", 1500)),
             "throttle_range": int(getattr(cfg, "DRONE_THROTTLE_RANGE", 300)),
             "input_sensitivity": float(getattr(cfg, "DRONE_INPUT_SENSITIVITY", 1.0)),
-            "max_yaw_rate": float(getattr(cfg, "DRONE_MAX_YAW_RATE", 90.0)),
-            "yaw_pwm_cap": getattr(cfg, "DRONE_YAW_PWM_CAP", None),
+            "max_yaw_rate": max_yaw_rate,
+            "yaw_pwm_cap": yaw_pwm_cap,
             "yaw_throttle_feedforward": float(
                 getattr(cfg, "DRONE_YAW_THROTTLE_FEEDFORWARD", 0.0)
             ),
@@ -704,7 +710,22 @@ def drive(
     if getattr(cfg, "USE_DRONE_SIM", False):
         camera_source = getattr(cfg, "DRONE_CAMERA_SOURCE", "gz_transport")
         if camera_source == "gz_transport":
-            camera_info = f"gz-transport  {getattr(cfg, 'DRONE_GZ_CAMERA_TOPIC', '(default topic)')}"
+            gz_world = os.environ.get("GZ_WORLD") or getattr(cfg, "GZ_WORLD", None)
+            gz_model_name = getattr(cfg, "DRONE_GZ_MODEL_NAME", None)
+            if gz_world and gz_model_name is None:
+                gz_model_name = (
+                    "betaloop_drone_cam_80mm"
+                    if gz_world.endswith("80mm")
+                    else "betaloop_drone_cam_65mm"
+                )
+            if gz_world and gz_model_name:
+                camera_topic = (
+                    f"/world/{gz_world}/model/{gz_model_name}"
+                    "/link/camera_link/sensor/camera/image"
+                )
+            else:
+                camera_topic = getattr(cfg, "DRONE_GZ_CAMERA_TOPIC", "(default topic)")
+            camera_info = f"gz-transport  {camera_topic}"
         else:
             camera_info = (
                 f"rtsp  {getattr(cfg, 'DRONE_RTSP_URL', 'rtsp://127.0.0.1:8554/live')}"

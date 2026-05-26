@@ -110,7 +110,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/a2/55/8f8cab2afd404cf57
 [[package]]
 name = "donkeycar"
 version = "5.2.dev6"
-source = { git = "https://github.com/dstair/donkeycar.git?rev=ca0b489b2c3292f3b70f32204054f174eb73945c#ca0b489b2c3292f3b70f32204054f174eb73945c" }
+source = { editable = "../donkeycar-fork" }
 dependencies = [
     { name = "docopt" },
     { name = "numpy" },
@@ -129,6 +129,75 @@ dependencies = [
     { name = "tornado" },
     { name = "utm" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "adafruit-circuitpython-rplidar", marker = "extra == 'nano'" },
+    { name = "adafruit-circuitpython-rplidar", marker = "extra == 'pi'" },
+    { name = "adafruit-circuitpython-ssd1306", marker = "extra == 'nano'" },
+    { name = "adafruit-circuitpython-ssd1306", marker = "extra == 'pi'" },
+    { name = "adafruit-pca9685", marker = "extra == 'nano'" },
+    { name = "adafruit-pca9685", marker = "extra == 'pi'" },
+    { name = "albumentations", marker = "extra == 'macos'" },
+    { name = "albumentations", marker = "extra == 'pc'" },
+    { name = "albumentations", marker = "extra == 'pi'" },
+    { name = "docopt" },
+    { name = "fastai", marker = "extra == 'torch'" },
+    { name = "flatbuffers", marker = "extra == 'pi'", specifier = "==24.3.*" },
+    { name = "jetson-gpio", marker = "extra == 'nano'" },
+    { name = "kivy", marker = "extra == 'macos'" },
+    { name = "kivy", marker = "extra == 'nano'" },
+    { name = "kivy", marker = "extra == 'pc'" },
+    { name = "kivy", marker = "extra == 'pi'" },
+    { name = "kivy-garden-matplotlib", marker = "extra == 'macos'" },
+    { name = "kivy-garden-matplotlib", marker = "extra == 'nano'" },
+    { name = "kivy-garden-matplotlib", marker = "extra == 'pc'" },
+    { name = "kivy-garden-matplotlib", marker = "extra == 'pi'" },
+    { name = "matplotlib", marker = "extra == 'macos'" },
+    { name = "matplotlib", marker = "extra == 'nano'", specifier = "==3.7.*" },
+    { name = "matplotlib", marker = "extra == 'pc'" },
+    { name = "matplotlib", marker = "extra == 'pi'" },
+    { name = "mypy", marker = "extra == 'dev'" },
+    { name = "numpy" },
+    { name = "numpy", marker = "extra == 'nano'", specifier = "==1.23.*" },
+    { name = "opencv-contrib-python", marker = "extra == 'pi'" },
+    { name = "paho-mqtt" },
+    { name = "pandas" },
+    { name = "pandas", marker = "extra == 'macos'" },
+    { name = "pandas", marker = "extra == 'nano'", specifier = "==2.0.*" },
+    { name = "pandas", marker = "extra == 'pc'" },
+    { name = "pandas", marker = "extra == 'pi'" },
+    { name = "picamera2", marker = "extra == 'pi'" },
+    { name = "pillow" },
+    { name = "plotly", marker = "extra == 'macos'" },
+    { name = "plotly", marker = "extra == 'nano'" },
+    { name = "plotly", marker = "extra == 'pc'" },
+    { name = "plotly", marker = "extra == 'pi'" },
+    { name = "prettytable" },
+    { name = "progress" },
+    { name = "psutil" },
+    { name = "pyfiglet" },
+    { name = "pynmea2" },
+    { name = "pyserial" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "pytorch-lightning", marker = "extra == 'torch'" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "responses", marker = "extra == 'dev'" },
+    { name = "rpi-gpio", marker = "extra == 'pi'" },
+    { name = "simple-pid" },
+    { name = "tensorflow", marker = "extra == 'macos'", specifier = "==2.15.*" },
+    { name = "tensorflow", marker = "extra == 'pc'", specifier = "==2.15.*" },
+    { name = "tensorflow-metal", marker = "extra == 'macos'" },
+    { name = "tflite-runtime", marker = "extra == 'pi'" },
+    { name = "torch", marker = "extra == 'torch'", specifier = "==2.1.*" },
+    { name = "torchaudio", marker = "extra == 'torch'" },
+    { name = "torchvision", marker = "extra == 'torch'" },
+    { name = "tornado" },
+    { name = "utm" },
+]
+provides-extras = ["pi", "nano", "pc", "macos", "dev", "torch"]
 
 [[package]]
 name = "filelock"
@@ -215,7 +284,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "albumentations", specifier = ">=2.0.8" },
-    { name = "donkeycar", git = "https://github.com/dstair/donkeycar.git?rev=ca0b489b2c3292f3b70f32204054f174eb73945c" },
+    { name = "donkeycar", editable = "../donkeycar-fork" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "protobuf", specifier = ">=7.34.1" },
     { name = "pygame", specifier = ">=2.6.1" },
