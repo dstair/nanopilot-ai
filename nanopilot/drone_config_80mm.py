@@ -21,9 +21,16 @@ CAMERA_TYPE = "MOCK"
 USE_FPV = True
 
 # Image resolution for the CNN pipeline (overrides DonkeyCar's 160x120 default).
-# The Gazebo camera model renders 640x480; use that natively in the pipeline.
+# The Gazebo camera model renders 640x480; use that natively for capture/recording.
 IMAGE_W = 640
 IMAGE_H = 480
+
+# Resolution the CNN actually trains and runs at. Decoupled from the capture
+# resolution above: full 640x480 frames make the data loader the bottleneck and
+# add no useful detail for flying a sim course. torch_train downscales tub
+# frames to this, and TorchPilot downscales live camera frames to match.
+TRAIN_IMAGE_W = 160
+TRAIN_IMAGE_H = 120
 
 # ---- Drive Train ----
 # No physical actuators; DroneGymEnv sends RC commands via UDP

@@ -195,10 +195,16 @@ class XboxDroneController:
                     logger.info("XboxBridge connected but no controller")
             return (
                 self.steering, self.throttle, self.roll, self.altitude,
-                self.mode, self.recording, self.armed, self.reset,
+                self.mode, self.armed, self.reset,
             )
 
-        # frame is guaranteed non-None below (we just returned otherwise).
+        # No frame this tick but bridge is alive and not stale — reuse last values.
+        if frame is None:
+            return (
+                self.steering, self.throttle, self.roll, self.altitude,
+                self.mode, self.armed, self.reset,
+            )
+
         lX, lY, rX, rY, lT, rT, btns, _conn = frame  # type: ignore[misc]
         btn_a = bool(btns & 0x01)
         btn_b = bool(btns & 0x02)
@@ -261,7 +267,7 @@ class XboxDroneController:
 
         return (
             self.steering, self.throttle, self.roll, self.altitude,
-            self.mode, self.recording, self.armed, self.reset,
+            self.mode, self.armed, self.reset,
         )
 
     def shutdown(self):

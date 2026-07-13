@@ -122,14 +122,10 @@ class TubDataset(Dataset):
 
         targets = torch.tensor(get_ctrl(record), dtype=torch.float32)
 
-        # 4. Load Previous Controls (Control Feedback)
-        prev_idx = max(0, idx - 1)
-        if self.records[prev_idx]['_tub_path'] != tub_path:
-            prev_idx = idx # Boundary fallback
-        
-        prev_controls = torch.tensor(get_ctrl(self.records[prev_idx]), dtype=torch.float32)
-
-        return image, imu_tensor, prev_controls, targets
+        # NOTE: previous controls are deliberately NOT returned as a model input.
+        # Consecutive tub controls are identical 90-99% of the time, so feeding the
+        # previous control lets the model "cheat" by copying it and ignoring vision.
+        return image, imu_tensor, targets
 
 '''
 ### How to use this in your training script:

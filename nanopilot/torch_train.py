@@ -49,8 +49,13 @@ def train(
     device = get_device()
     print(f"Device: {device}")
 
-    image_h = getattr(cfg, 'IMAGE_H', 120)
-    image_w = getattr(cfg, 'IMAGE_W', 160)
+    # Training/inference resolution is decoupled from the camera capture
+    # resolution: the sim captures at IMAGE_W/H (640x480), but we downscale to a
+    # small TRAIN_IMAGE_W/H for the CNN. Full-res frames make the data loader the
+    # bottleneck and add nothing for a sim course. Keep this in sync with
+    # TorchPilot's input_shape at runtime.
+    image_h = getattr(cfg, 'TRAIN_IMAGE_H', 120)
+    image_w = getattr(cfg, 'TRAIN_IMAGE_W', 160)
     image_d = getattr(cfg, 'IMAGE_DEPTH', 3)
     batch_size = batch_size_override or getattr(cfg, 'BATCH_SIZE', 128)
     max_epochs = max_epochs_override or getattr(cfg, 'MAX_EPOCHS', 100)
@@ -102,10 +107,15 @@ def train(
     print(f"Train: {n_train}, Val: {n_val}")
 
     pin = device.type == 'cuda'
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=pin)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=0, pin_memory=pin)
+    # Parallel workers keep the (MPS/CUDA) device fed with decoded JPEGs instead
+    # of decoding single-threaded on the main process.
+    num_workers = getattr(cfg, 'TRAIN_NUM_WORKERS', 4)
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin)
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = 4
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     # Model
     model = LinearModel(
@@ -122,9 +132,12 @@ def train(
         print(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # HuberLoss is more robust to outliers than MSE, reducing "twitchy" flight
-    # We apply weights to the [yaw, pitch, roll, altitude] axes to prioritize height.
-    loss_weights = torch.tensor(getattr(cfg, 'TRAIN_LOSS_WEIGHTS', [1.0, 1.0, 1.2, 3.5]), device=device)
+    # HuberLoss is more robust to outliers than MSE, reducing "twitchy" flight.
+    # Per-axis weights on [yaw, pitch, roll, altitude]. Keep these near-uniform:
+    # altitude in the current tubs is almost always ~0 (std ~0.02), so a large
+    # altitude weight just makes the loss dominated by a trivially-predicted axis
+    # and starves the axes that carry real visual signal (yaw/roll).
+    loss_weights = torch.tensor(getattr(cfg, 'TRAIN_LOSS_WEIGHTS', [1.0, 1.0, 1.0, 1.0]), device=device)
 
     def criterion(pred, target):
         # Calculate per-element Huber loss
@@ -143,10 +156,10 @@ def train(
         # Train
         model.train()
         train_loss = 0.0
-        for images, imus, prev_ctrls, labels in train_loader:
-            images, imus, prev_ctrls, labels = images.to(device), imus.to(device), prev_ctrls.to(device), labels.to(device)
+        for images, imus, labels in train_loader:
+            images, imus, labels = images.to(device), imus.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(images, imus, prev_ctrls)
+            outputs = model(images, imus)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -157,9 +170,9 @@ def train(
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for images, imus, prev_ctrls, labels in val_loader:
-                images, imus, prev_ctrls, labels = images.to(device), imus.to(device), prev_ctrls.to(device), labels.to(device)
-                outputs = model(images, imus, prev_ctrls)
+            for images, imus, labels in val_loader:
+                images, imus, labels = images.to(device), imus.to(device), labels.to(device)
+                outputs = model(images, imus)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * images.size(0)
         val_loss /= n_val

@@ -1,14 +1,19 @@
 """
-Modern PyTorch CNN for Autonomous Drone Flight.
+PyTorch CNN for Autonomous Drone Flight (behavior cloning).
 
 Features:
-- Residual connections for better gradient flow.
-- Batch Normalization for training stability.
-- Squeeze-and-Excitation (SE) for channel-wise attention.
-- GELU activations for smoother non-linearity.
-- Global Average Pooling to reduce parameter count.
+- Small residual backbone with BatchNorm + SE for stable, cheap feature extraction.
+- Global Average Pooling makes the net resolution-independent.
+- A small GRU summarizes the recent IMU sequence.
+- Vision and IMU features are concatenated and passed to a regression head.
 
-Input:  (B, 3, H, W) float32 [0, 1]
+Deliberately does NOT take previous controls as an input. In behavior-cloning
+tubs, consecutive controls are identical 90-99% of the time, so feeding the
+previous control lets the model score near-zero loss by copying it and ignoring
+the camera. At runtime that becomes a self-referential loop that never responds
+to vision. Dropping that input forces the policy to actually use the image.
+
+Input:  img (B, 3, H, W) float32 [0, 1], imu (B, seq_len, 6) float32
 Output: (B, 4) — [yaw, pitch, roll, altitude]
 """
 
@@ -62,15 +67,17 @@ class ResidualBlock(nn.Module):
 
 
 class LinearModel(nn.Module):
-    def __init__(self, input_shape=(3, 120, 160), imu_shape=(3, 6), control_dim=4):
+    def __init__(self, input_shape=(3, 120, 160), imu_shape=(3, 6)):
         """
         Args:
             input_shape: (C, H, W) image dimensions.
             imu_shape: (Sequence Length, Channels) e.g., (3, 6) for 3 steps of [accel, gyro].
-            control_dim: Dimension of previous controls (yaw, pitch, roll, altitude).
         """
         super().__init__()
-        
+
+        self.vis_feat_dim = 256
+        self.imu_hidden_dim = 32
+
         # Initial feature extraction
         self.init_conv = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=3, stride=2, padding=1, bias=False),
@@ -82,35 +89,20 @@ class LinearModel(nn.Module):
         self.layer1 = ResidualBlock(32, 64, stride=2)   # (H/4, W/4)
         self.layer2 = ResidualBlock(64, 128, stride=2)  # (H/8, W/8)
         self.layer3 = ResidualBlock(128, 256, stride=2) # (H/16, W/16)
-        self.layer4 = ResidualBlock(256, 256, stride=1)
+        self.layer4 = ResidualBlock(256, self.vis_feat_dim, stride=1)
 
         # Global pooling makes the model resolution-independent and reduces params
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        # IMU branch: Using a GRU to capture temporal dynamics
+        # IMU branch: a small GRU captures temporal dynamics.
         # Input shape: (Batch, Seq, Feat) -> Output: (Batch, Hidden)
-        self.imu_hidden_dim = 32
-        self.imu_gru = nn.GRU(input_size=imu_shape[1], hidden_size=self.imu_hidden_dim, 
-                             num_layers=1, batch_first=True)
+        self.imu_gru = nn.GRU(input_size=imu_shape[1], hidden_size=self.imu_hidden_dim,
+                              num_layers=1, batch_first=True)
 
-        # Control Feedback branch
-        self.ctrl_fc = nn.Sequential(
-            nn.Linear(control_dim, 16),
-            nn.GELU()
-        )
-
-        # Cross-Attention Fusion
-        # We project all features into a shared embedding space for the attention block
-        self.embed_dim = 128
-        self.vis_proj = nn.Linear(256, self.embed_dim)
-        self.imu_proj = nn.Linear(self.imu_hidden_dim, self.embed_dim)
-        self.ctrl_proj = nn.Linear(16, self.embed_dim)
-        
-        self.fusion_attention = nn.MultiheadAttention(embed_dim=self.embed_dim, num_heads=4, batch_first=True)
-
-        # Prediction head
+        # Prediction head: concatenated vision + IMU features -> 4 controls.
+        fused_dim = self.vis_feat_dim + self.imu_hidden_dim
         self.fc = nn.Sequential(
-            nn.Linear(self.embed_dim * 3, 128),
+            nn.Linear(fused_dim, 128),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(128, 64),
@@ -118,7 +110,7 @@ class LinearModel(nn.Module):
             nn.Linear(64, 4)
         )
 
-    def forward(self, img, imu, prev_ctrl=None):
+    def forward(self, img, imu):
         # Image branch
         x = self.init_conv(img)
         x = self.layer1(x)
@@ -126,29 +118,11 @@ class LinearModel(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        vis_feat = torch.flatten(x, 1)
 
-        # IMU branch: Process sequence through GRU
-        # we only take the last hidden state representing the sequence summary
+        # IMU branch: process the sequence through the GRU, keep the last hidden state.
         _, h_n = self.imu_gru(imu)
-        imu_feat = h_n[-1] # Shape: (Batch, hidden_dim)
+        imu_feat = h_n[-1]  # (Batch, imu_hidden_dim)
 
-        if prev_ctrl is None:
-            prev_ctrl = torch.zeros(img.shape[0], 4, device=img.device, dtype=img.dtype)
-
-        # Control Feedback branch
-        ctrl_feat = self.ctrl_fc(prev_ctrl)
-
-        # Multi-modal Cross-Attention Fusion
-        # 1. Project to shared embedding space
-        v_tokens = self.vis_proj(x).unsqueeze(1)          # (B, 1, E)
-        i_tokens = self.imu_proj(imu_feat).unsqueeze(1)    # (B, 1, E)
-        c_tokens = self.ctrl_proj(ctrl_feat).unsqueeze(1)  # (B, 1, E)
-
-        # 2. Form a sequence of tokens and apply attention
-        tokens = torch.cat([v_tokens, i_tokens, c_tokens], dim=1) # (B, 3, E)
-        attn_out, _ = self.fusion_attention(tokens, tokens, tokens)
-        
-        # 3. Flatten tokens and pass to final head
-        fused = torch.flatten(attn_out, 1)
+        fused = torch.cat([vis_feat, imu_feat], dim=1)
         return self.fc(fused)

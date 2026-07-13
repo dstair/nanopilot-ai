@@ -371,6 +371,13 @@ def drive(
     """
     logger.info(f"PID: {os.getpid()}")
 
+    # Normalize the model path. --model takes a single path; a stray trailing
+    # comma or surrounding whitespace (common copy/paste artifact) would
+    # otherwise fail the `.pth` check and silently route a PyTorch checkpoint
+    # into the DonkeyCar Keras branch, which crashes confusingly.
+    if model_path:
+        model_path = model_path.strip().strip(",").strip()
+
     if model_type is None:
         if cfg.TRAIN_LOCALIZER:
             model_type = "localizer"
@@ -514,8 +521,14 @@ def drive(
         if model_path.endswith(".pth"):
             from torch_pilot import TorchPilot
 
+            # Use the training resolution, not the camera capture resolution:
+            # TorchPilot downscales incoming frames to this internally.
             kl = TorchPilot(
-                input_shape=(cfg.IMAGE_DEPTH, cfg.IMAGE_H, cfg.IMAGE_W),
+                input_shape=(
+                    cfg.IMAGE_DEPTH,
+                    getattr(cfg, "TRAIN_IMAGE_H", cfg.IMAGE_H),
+                    getattr(cfg, "TRAIN_IMAGE_W", cfg.IMAGE_W),
+                ),
                 seq_len=getattr(cfg, "SEQUENCE_LENGTH", 3),
             )
         else:
@@ -1022,7 +1035,7 @@ def add_user_controller(V, cfg, use_joystick, use_xbox=False, input_image="ui/im
 
         xbox_ctr = XboxDroneController(
             deadzone=getattr(cfg, "XBOX_DEADZONE", 0.08),
-            steering_scale=getattr(cfg, "XBOX_STEERING_SCALE", 1.0),
+            steering_scale=getattr(cfg, "XBOX_STEERING_SCALE", 0.25),
             throttle_scale=getattr(cfg, "XBOX_THROTTLE_SCALE", 1.0),
             roll_scale=getattr(cfg, "XBOX_ROLL_SCALE", 1.0),
             altitude_scale=getattr(cfg, "XBOX_ALTITUDE_SCALE", 1.0),
@@ -1036,7 +1049,6 @@ def add_user_controller(V, cfg, use_joystick, use_xbox=False, input_image="ui/im
                 "user/roll",
                 "user/altitude",
                 "user/mode",
-                "recording",
                 "user/arm",
                 "user/reset",
             ],

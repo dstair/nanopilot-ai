@@ -130,10 +130,15 @@ def safe_corrcoef(preds, targets):
 def checkpoint_kind(state_dict):
     if any(k.startswith("imu_fc.") for k in state_dict):
         return "legacy_imu_fc"
-    if any(k.startswith("ctrl_fc.") for k in state_dict):
+    if any(k.startswith("ctrl_fc.") for k in state_dict) or any(
+        k.startswith("fusion_attention.") for k in state_dict
+    ):
         return "control_feedback"
     if any(k.startswith("imu_gru.") for k in state_dict):
-        return "legacy_imu_gru"
+        # Current vision+IMU model and the legacy GRU model share layer names;
+        # they differ only in the output width (4 controls vs the old 3).
+        out_dim = state_dict["fc.5.weight"].shape[0] if "fc.5.weight" in state_dict else 4
+        return "legacy_imu_gru" if out_dim == 3 else "current"
     return "unknown"
 
 
@@ -144,6 +149,12 @@ def load_model(model_path, device, input_shape, imu_shape):
         model = LegacyImuFcLinearModel(input_shape=input_shape, imu_shape=imu_shape)
     elif kind == "legacy_imu_gru":
         model = LegacyImuGruLinearModel(input_shape=input_shape, imu_shape=imu_shape)
+    elif kind == "control_feedback":
+        raise RuntimeError(
+            f"{model_path} is a retired control-feedback/attention checkpoint "
+            "(has ctrl_fc/fusion_attention weights) and is not compatible with the "
+            "current vision+IMU LinearModel. Retrain with torch_train.py."
+        )
     else:
         model = LinearModel(input_shape=input_shape, imu_shape=imu_shape)
     model = model.to(device)
@@ -214,8 +225,8 @@ def evaluate_model(
     all_preds = []
     all_targets = []
     with torch.no_grad():
-        for images, imus, prev_ctrls, targets in loader:
-            outputs = model(images.to(device), imus.to(device), prev_ctrls.to(device))
+        for images, imus, targets in loader:
+            outputs = model(images.to(device), imus.to(device))
             all_preds.append(outputs.cpu().numpy())
             all_targets.append(targets.numpy())
 
@@ -293,8 +304,8 @@ def main():
     parser.add_argument("--model", help="Model path to evaluate")
     parser.add_argument("--old-model", help="Baseline model path")
     parser.add_argument("--new-model", help="Candidate model path")
-    parser.add_argument("--image-h", type=int, default=240)
-    parser.add_argument("--image-w", type=int, default=320)
+    parser.add_argument("--image-h", type=int, default=120)
+    parser.add_argument("--image-w", type=int, default=160)
     parser.add_argument("--seq-len", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(

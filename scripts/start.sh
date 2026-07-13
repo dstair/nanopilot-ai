@@ -51,6 +51,7 @@ if [ "$AIRFRAME" = "80mm" ]; then
     DEFAULT_WORLD="baylands_80mm"
 fi
 GZ_WORLD="${GZ_WORLD:-$DEFAULT_WORLD}"
+GZ_WORLD="${GZ_WORLD%.sdf}"  # strip .sdf if user included it
 export GZ_WORLD
 
 # Resource paths: project worlds + aeroloop_gazebo models (if present)

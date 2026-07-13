@@ -30,13 +30,17 @@ import subprocess
 import sys
 import threading
 import time
+import gymnasium as gym
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from gz_telemetry import PoseTracker, init_pose_subscriber, init_sim_telemetry
+try:
+    from nanopilot.gz_telemetry import PoseTracker, init_pose_subscriber, init_sim_telemetry
+except ImportError:
+    from gz_telemetry import PoseTracker, init_pose_subscriber, init_sim_telemetry
 from utils.betaflight import MSPClient, pack_rc_frame
 
 logger = logging.getLogger(__name__)
@@ -49,7 +53,7 @@ _GZ_CAMERA_TOPIC_DEFAULT = (
 _YAW_DEG_PER_SEC_PER_PWM = 0.30
 
 
-class DroneGymEnv:
+class DroneGymEnv(gym.Env):
     """
     DonkeyCar part that interfaces with BetaFlight SITL + Gazebo via UDP RC.
 
@@ -103,6 +107,7 @@ class DroneGymEnv:
         gz_model_name=None,
         gz_imu_topic=None,
     ):
+        super().__init__()
         self.rc_host = rc_host
         self.rc_port = rc_port
         self.camera_source = camera_source
@@ -204,6 +209,15 @@ class DroneGymEnv:
                 deadband=self.altitude_hold_deadband,
                 enabled=self.altitude_hold_enabled,
             )
+
+        # RL Space Definitions
+        # Actions: [steering, throttle, roll, altitude] all in [-1, 1]
+        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
+        # Observation: Image + IMU (simplified for this example)
+        self.observation_space = gym.spaces.Dict({
+            "image": gym.spaces.Box(low=0, high=255, shape=(image_h, image_w, 3), dtype=np.uint8),
+            "imu": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
+        })
 
         logger.info(
             "Flight mode request: %s (CH%d/AUX%d PWM=%d)",
@@ -425,6 +439,73 @@ class DroneGymEnv:
 
         return channels
 
+    def step(self, action):
+        """Standard Gymnasium step function for RL training."""
+        # Action is usually a numpy array from SB3
+        self.steering, self.throttle, self.roll, self.altitude = action.flatten().tolist()
+        
+        time.sleep(1.0 / 30.0) # Wait for simulation step
+
+        # Pull latest telemetry from background simulation feed
+        if getattr(self, "_sim_telemetry", None) is not None:
+            self.position = self._sim_telemetry.position
+            self.attitude = self._sim_telemetry.attitude
+            self.velocity = self._sim_telemetry.velocity
+            self.imu = self._sim_telemetry.imu
+        
+        # 3. Calculate Reward
+        reward = 0.0
+        done = False
+        
+        # Penalty for crashing or flying too high/low
+        if self.position[2] < 0.2 or self.position[2] > 10.0:
+            reward = -10.0
+            done = True
+        else:
+            # Reward for progress toward target
+            current_pos = np.array(self.position)
+            dist_to_target = np.linalg.norm(current_pos - self._target_pos)
+            
+            if self._prev_pos is not None:
+                prev_dist = np.linalg.norm(self._prev_pos - self._target_pos)
+                reward += (prev_dist - dist_to_target) * 5.0 # Reward moving closer
+            
+            self._prev_pos = current_pos
+            
+            # Small penalty for high angular rates (prevent spinning)
+            reward -= np.linalg.norm(self.imu[3:]) * 0.01
+
+        # Stable Baselines3/PyTorch expects CHW format
+        obs_image = np.transpose(self.frame, (2, 0, 1)).astype(np.uint8)
+
+        obs = {
+            "image": obs_image,
+            "imu": np.array(self.imu, dtype=np.float32).flatten(),
+            "velocity": np.array(self.velocity, dtype=np.float32).flatten()
+        }
+        
+        return obs, reward, done, False, {}
+
+    def reset(self, seed=None, options=None):
+        """Standard Gymnasium reset."""
+        super().reset(seed=seed)
+        self._do_reset()
+        time.sleep(1.0) # Wait for Gazebo to settle
+        
+        # Pull latest telemetry
+        if getattr(self, "_sim_telemetry", None) is not None:
+            self.position = self._sim_telemetry.position
+            self.attitude = self._sim_telemetry.attitude
+            self.velocity = self._sim_telemetry.velocity
+            self.imu = self._sim_telemetry.imu
+
+        obs = {
+            "image": np.transpose(self.frame, (2, 0, 1)).astype(np.uint8),
+            "imu": np.array(self.imu, dtype=np.float32).flatten(),
+            "velocity": np.array(self.velocity, dtype=np.float32).flatten()
+        }
+        return obs, {}
+
     def _query_arming_flags(self, timeout=0.5):
         """Query MSP_STATUS_EX and return BF's arming-disable + active-mode state.
         Now delegated to MSPClient for repository-wide reuse.
@@ -632,10 +713,11 @@ class DroneGymEnv:
             logger.error("BetaFlight loop error: %s", e)
 
     def _do_reset(self):
-        """Teleport the drone back to spawn position via gz-transport set_pose."""
+        """Teleport the drone back to spawn position via gz-transport set_pose_vector."""
         try:
             from gz.transport13 import Node
             from gz.msgs10.pose_v_pb2 import Pose_V
+            from gz.msgs10.boolean_pb2 import Boolean
 
             node = Node()
             pose_msg = Pose_V()
@@ -646,8 +728,10 @@ class DroneGymEnv:
             p.position.z = 0.5
             p.orientation.w = 1.0
             result, _reply = node.request(
-                f"/world/{self.gz_world}/set_pose",
+                f"/world/{self.gz_world}/set_pose_vector",
                 pose_msg,
+                type(pose_msg),
+                Boolean,
                 1000,
             )
             if result:
@@ -843,6 +927,5 @@ class DroneGymEnv:
                 self._shm.unlink()
             except FileNotFoundError:
                 # The camera worker/resource_tracker can win this cleanup race
-                # on process exit. The segment is already gone, which is fine.
                 pass
-            self._shm = None
+    

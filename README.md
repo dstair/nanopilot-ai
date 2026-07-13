@@ -274,8 +274,7 @@ All these .sdf files are in the worlds/ folder. They are provided to allow the C
 - drone_course_80mm
 - drone_course_65mm: retained Air65 course world
 
-GZ_WORLD=slalom_gates_80mm ./scripts/start.sh
-
+GZ_WORLD=slalom_gates_80mm ./scripts/start.sh --xbox
 
 ## Troubleshooting
 
@@ -390,41 +389,31 @@ X add/test input controller support.
 X try a different world.
 X add roll for better handling.
 X add an 80mm size that matches the Pavo Pico II
-
 X with battery, 79g.
 X worlds - all 80 mm
-
 X clean up the UI. Want to show pitch, roll, yaw, and throttle.
   X add status indicator, i.e. ARMED
 X black background for nanopilot UI
-
 X Address vertical climb issue.
 X fix skating rink effect.
   X Test horizontalVelocityDecay of 0.35 
-
 X Angular drag: adding angular drag (e.g., velocity_decay <angular>) to the model.sdf or the BetaflightPlugin would contribute to more realistic rotational dynamics
-
 X Fix Yaw Speed.
 X 640x480
-
 X drone loses altitude slowly during forward flight, how to compensate??
-
 X increase horizontal damping to 0.35.
-
 X Surface more configs in the UI.
   X max throttle range.
   X max roll angle
   X max pitch angle
   X PWM adjustment factors
-
-
-X Consider More Advanced Drag Models:
-Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
-
+X Consider More Advanced Drag Models: Implemented additive quadratic horizontal drag in BetaflightPlugin as `F_xy = -m * (linear + quadratic * |v_xy|) * v_xy`.
 
 X Refine model flight characteristics. At some point it still crashes in to the ground. If no road is visible it gets stuck flying in circles.
 
 - try something simpler like just flying through gates? That seems like a better initial pass.
+
+- Add RL component? RLAIF with its own UI? Gates are an interesting example. Or landing zone. Basically, get Drone to a target zone.
 
 X UI - boxes are a bit small at 164 pixels. Double the size. Also put one on left hand side, one on right hand side for better aesthetics.
 X UI - some components like input sensitivity just show --; remove them or fix them.
@@ -439,4 +428,7 @@ X UI - some components like input sensitivity just show --; remove them or fix t
 - maybe look at implementing a VLM model??
 - Add randomization of worlds (wall locations, colors) for better CNN training
 - research other tasks that would be interesting to implement (CNN to scan/build a 3D model of an object, for example)
+
+
+
 
