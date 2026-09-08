@@ -1,7 +1,10 @@
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+
+from tub_schema import heading_frame_velocity
 from PIL import Image
+import math
 import os
 import json
 
@@ -12,21 +15,38 @@ class TubDataset(Dataset):
         'gyro': 5.0    # rad/s
     }
 
-    def __init__(self, tub_paths, seq_len=3, transform=None):
+    def __init__(self, tub_paths, seq_len=3, transform=None,
+                 altitude_pwm_scale=None):
         """
         Args:
             tub_paths: List of paths to donkeycar tubs.
             seq_len: Number of historical IMU steps to include.
             transform: PyTorch transforms for the image.
+            altitude_pwm_scale: if set (e.g. DRONE_THROTTLE_SCALE=0.2), train the
+                altitude target in throttle-PWM space instead of raw command
+                space. DroneGymEnv applies sign(a)*|a|**scale to turn the
+                altitude command into a PWM offset, and that curve is nearly
+                vertical at zero: alt=-0.0001 is already -15.8 PWM. So raw
+                altitude labels look like a degenerate spike (std ~0.02) while
+                the thrust they represent spans std ~40 PWM. Regression in raw
+                space therefore cannot see flight-relevant error -- a 0.008
+                label error is ~1e-5 of loss but ~9 PWM of sustained thrust.
+                Pre-applying the curve makes the target linear in thrust, with
+                std ~0.40, comparable to the pitch/roll axes. TorchPilot must
+                apply the inverse (power 1/scale) at inference.
         """
         self.tub_paths = tub_paths
         self.seq_len = seq_len
         self.transform = transform
+        self.altitude_pwm_scale = altitude_pwm_scale
         self.records = []
         self.imu_keys = [
             'imu/acl_x', 'imu/acl_y', 'imu/acl_z',
             'imu/gyr_x', 'imu/gyr_y', 'imu/gyr_z'
         ]
+        # Recorded by every drone tub (DRONE_TUB_INPUTS) but historically unused
+        # by the model. See heading_frame_velocity() for why the student needs it.
+        self.vel_keys = ['vel/vel_x', 'vel/vel_y', 'vel/vel_z']
         self.missing_imu_records = 0
         
         # Load all record metadata
@@ -120,12 +140,28 @@ class TubDataset(Dataset):
                 r.get('user/altitude', 0.0),
             ]
 
-        targets = torch.tensor(get_ctrl(record), dtype=torch.float32)
+        # 2b. Velocity, rotated into the drone-heading frame (yaw-invariant) and
+        # scaled, exactly as the teacher observed it.
+        vel_tensor = torch.tensor(
+            heading_frame_velocity(
+                float(record.get('vel/vel_x', 0.0)),
+                float(record.get('vel/vel_y', 0.0)),
+                float(record.get('vel/vel_z', 0.0)),
+                float(record.get('imu/yaw', 0.0)),
+            ),
+            dtype=torch.float32,
+        )
+
+        ctrl = get_ctrl(record)
+        if self.altitude_pwm_scale is not None:
+            a = float(ctrl[3])
+            ctrl[3] = math.copysign(abs(a) ** self.altitude_pwm_scale, a)
+        targets = torch.tensor(ctrl, dtype=torch.float32)
 
         # NOTE: previous controls are deliberately NOT returned as a model input.
         # Consecutive tub controls are identical 90-99% of the time, so feeding the
         # previous control lets the model "cheat" by copying it and ignoring vision.
-        return image, imu_tensor, targets
+        return image, imu_tensor, vel_tensor, targets
 
 '''
 ### How to use this in your training script:

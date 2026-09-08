@@ -188,6 +188,8 @@ class LocalWebController(_LocalWebController):
                 getattr(cfg, "DRONE_PITCH_THROTTLE_FEEDFORWARD", 0.0)
             ),
             "altitude_hold_k": float(getattr(cfg, "DRONE_ALTITUDE_HOLD_K", 30.0)),
+            "altitude_hold_kp": float(getattr(cfg, "DRONE_ALTITUDE_HOLD_KP", 0.0)),
+            "altitude_trim_range": float(getattr(cfg, "DRONE_ALTITUDE_TRIM_RANGE", 0.0)),
             "altitude_hold_deadband": float(
                 getattr(cfg, "DRONE_ALTITUDE_HOLD_DEADBAND", 0.05)
             ),
@@ -296,7 +298,8 @@ from donkeycar.parts.transform import Lambda
 from donkeycar.parts.pipe import Pipe
 from donkeycar.utils import *
 from drone_env import build_drone_env
-from tub_schema import IMU_KEYS, drone_tub_schema
+from tub_schema import (IMU_KEYS, VELOCITY_KEYS, drone_tub_schema,
+                        prune_if_empty)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -530,6 +533,8 @@ def drive(
                     getattr(cfg, "TRAIN_IMAGE_W", cfg.IMAGE_W),
                 ),
                 seq_len=getattr(cfg, "SEQUENCE_LENGTH", 3),
+                altitude_pwm_scale=(getattr(cfg, "DRONE_THROTTLE_SCALE", None)
+                                    if getattr(cfg, "TRAIN_ALTITUDE_PWM_SPACE", False) else None),
             )
         else:
             kl = dk.utils.get_model_by_type(model_type, cfg)
@@ -605,7 +610,23 @@ def drive(
                 and getattr(cfg, "USE_DRONE_SIM", False)
                 and getattr(cfg, "DRONE_RECORD_IMU", False)
             ):
-                inputs += IMU_KEYS
+                # The current model REQUIRES velocity (the teacher's altitude
+                # control is velocity feedback). vel/* and imu/yaw only exist in
+                # vehicle memory when their record flags are on, so refuse
+                # rather than silently feeding the pilot None.
+                if not getattr(cfg, "DRONE_RECORD_VELOCITY", False):
+                    raise RuntimeError(
+                        "DRONE_RECORD_VELOCITY must be True: the autopilot model "
+                        "takes a velocity input."
+                    )
+                if not getattr(cfg, "DRONE_RECORD_ATTITUDE", False):
+                    raise RuntimeError(
+                        "DRONE_RECORD_ATTITUDE must be True: velocity is rotated "
+                        "into the heading frame using imu/yaw."
+                    )
+                # Order must match TorchPilot.run's signature:
+                # image, IMU, velocity, yaw.
+                inputs += IMU_KEYS + VELOCITY_KEYS + ["imu/yaw"]
 
         # Model outputs
         outputs = ["pilot/angle", "pilot/throttle", "pilot/roll", "pilot/altitude"]
@@ -782,6 +803,9 @@ def drive(
         import traceback
 
         traceback.print_exc()
+
+    if cfg.AUTO_CREATE_NEW_TUB and prune_if_empty(tub_writer.tub):
+        print(f"No records were written; removed empty tub: {tub_path}")
 
 
 # --- Helper classes reused from manage.py ---

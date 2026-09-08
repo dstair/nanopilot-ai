@@ -23,6 +23,7 @@ Requires:
 
 import collections
 import logging
+import math
 import os
 import socket
 import struct
@@ -50,7 +51,19 @@ _GZ_CAMERA_TOPIC_DEFAULT = (
     "/world/drone_course_65mm/model/betaloop_drone_cam_65mm"
     "/link/camera_link/sensor/camera/image"
 )
-_YAW_DEG_PER_SEC_PER_PWM = 0.30
+# Yaw rate delivered per PWM microsecond of CH4 deflection, calibrated AT the
+# 120 deg/s operating point. Re-measured 2026-09-06 with dense, UNWRAPPED yaw
+# sampling (scripts/probe_velocity.py "yaw rate" leg):
+#
+#   100 PWM ->  36.8 deg/s      200 PWM -> 120.9 deg/s      400 PWM -> 423 deg/s
+#
+# The response is strongly expo, so no single constant is right everywhere; this
+# one is chosen so DRONE_MAX_YAW_RATE=120 yields a ~200 PWM cap and full stick
+# really is ~120 deg/s. The previous value (0.30) came from an old measurement
+# and produced a 400 PWM cap, i.e. 423 deg/s at full stick -- 3.5x what the
+# config asked for. That mis-scaling made every yaw command far more aggressive
+# than intended, including the RL teachers'.
+_YAW_DEG_PER_SEC_PER_PWM = 0.60
 
 
 class DroneGymEnv(gym.Env):
@@ -96,8 +109,18 @@ class DroneGymEnv(gym.Env):
         yaw_throttle_feedforward=0.0,
         pitch_throttle_feedforward=0.0,
         altitude_hold_k=30.0,
+        altitude_hold_kp=0.0,
+        altitude_trim_range=0.0,
         altitude_hold_deadband=0.05,
         altitude_hold_enabled=True,
+        velocity_control=False,
+        max_forward_speed=2.0,
+        max_lateral_speed=1.0,
+        velocity_kp_fwd=0.6,
+        velocity_kff_fwd=0.35,
+        velocity_kp_lat=1.2,
+        velocity_kff_lat=0.8,
+        velocity_tau=0.1,
         angle_mode=True,
         record_position=False,
         record_attitude=False,
@@ -131,8 +154,51 @@ class DroneGymEnv(gym.Env):
         self.loop_delay_log_interval = loop_delay_log_interval
         self.input_sensitivity = float(max(0.0, min(1.0, input_sensitivity)))
         self.altitude_hold_k = float(altitude_hold_k)
+        # Position (proportional) gain, PWM per metre of height error. 0 keeps
+        # the historical pure-velocity-damper behaviour.
+        self.altitude_hold_kp = float(altitude_hold_kp)
+        # How far the in-deadband altitude command may shift the held height,
+        # in metres per unit of the (curve-shaped) command.
+        self.altitude_trim_range = float(altitude_trim_range)
         self.altitude_hold_deadband = float(altitude_hold_deadband)
+        # Height the hold regulates about; None until hold mode is first entered.
+        self._alt_setpoint = None
         self.altitude_hold_enabled = bool(altitude_hold_enabled)
+
+        # ---- Velocity control mode ----
+        # When enabled the pitch/roll inputs stop being ANGLE commands and
+        # become SPEED SETPOINTS in the drone-heading frame, closed by a P+FF
+        # cascade against measured velocity. The altitude input likewise becomes
+        # a LINEAR height trim instead of a curve-shaped thrust command.
+        #
+        # Why: every distillation failure in this project traced back to the
+        # learned policy having to produce a precisely calibrated THRUST/tilt.
+        # A 5 PWM altitude bias (2.5% of full scale, invisible in val_loss) was
+        # fatal because the plant integrated it. With setpoints, a small command
+        # error is a slightly wrong speed that the next frame corrects.
+        self.velocity_control = bool(velocity_control)
+        self.max_forward_speed = float(max_forward_speed)
+        self.max_lateral_speed = float(max_lateral_speed)
+        # Gains are PER AXIS because the airframe's authority is: pitch is
+        # limited to 20 degrees and roll to 10, so an identical roll stick buys
+        # half the acceleration. Measured open-loop 2026-09-06: pitch stick 0.30
+        # -> 0.73 m/s and 0.50 -> 1.53, roll 0.60 -> 0.72 and 1.00 -> 1.52.
+        # KFF is stick per m/s at cruise (the inverse of those slopes); KP sets
+        # the loop bandwidth, ~2 rad/s on both axes given d(accel)/d(stick) of
+        # 3.57 m/s^2 on pitch and 1.79 on roll.
+        self.velocity_kp_fwd = float(velocity_kp_fwd)
+        self.velocity_kff_fwd = float(velocity_kff_fwd)
+        self.velocity_kp_lat = float(velocity_kp_lat)
+        self.velocity_kff_lat = float(velocity_kff_lat)
+        self.velocity_tau = float(velocity_tau)
+        self._velocity_warned = False
+        # Explicit thrust command from run_threaded(direct_thrust=...). Bypasses
+        # the altitude hold entirely; takeoff/landing ramps need raw thrust and
+        # must keep working unchanged in velocity mode.
+        self._direct_thrust = None
+        # Stick values the cascade produced, exposed for probes and logging.
+        self.last_pitch_cmd = 0.0
+        self.last_roll_cmd = 0.0
         self.angle_mode = bool(angle_mode)
         # Max CH4 (yaw) deflection in PWM microseconds from center (1500).
         # When no explicit PWM cap is provided, derive it from the desired yaw
@@ -167,6 +233,9 @@ class DroneGymEnv(gym.Env):
         self._prev_user_arm = None
         self._explicit_arm_started_at = None
         self._reset_requested = False
+        # Pose used by _do_reset teleports: (x, y, z, yaw). RL episode resets
+        # overwrite this to randomize spawn; everything else keeps the default.
+        self.spawn_pose = (0.0, 0.0, 0.5, 0.0)
         self.last_roll_pwm = 1500
         self.last_pitch_pwm = 1500
         self.last_yaw_pwm = 1500
@@ -208,6 +277,7 @@ class DroneGymEnv(gym.Env):
                 k_pwm=self.altitude_hold_k,
                 deadband=self.altitude_hold_deadband,
                 enabled=self.altitude_hold_enabled,
+                vel_tau=self.velocity_tau,
             )
 
         # RL Space Definitions
@@ -362,24 +432,130 @@ class DroneGymEnv(gym.Env):
         roll_angle_ratio = self.max_roll_angle / max(1.0, self.max_pitch_angle)
         roll_deflection = pitch_deflection * roll_angle_ratio
 
-        # CH1: roll (lateral bank)
-        roll = max(-1.0, min(1.0, self.roll))
-        channels[0] = int(max(1000, min(2000, 1500 + roll * roll_deflection)))
+        # Velocity cascade: turn speed setpoints into angle sticks.
+        #
+        # throttle -> forward speed setpoint, roll -> rightward speed setpoint,
+        # both as a fraction of the configured max. A proportional term closes
+        # the loop on measured velocity and a feed-forward term supplies the
+        # tilt that holds cruise speed against drag, so the P term only has to
+        # correct the residual.
+        pitch_cmd = self.throttle
+        roll_cmd = self.roll
+        if self.velocity_control:
+            tracker = self._pose_tracker
+            if tracker is None or not tracker.enabled:
+                # No velocity feedback available: the cascade would be pure
+                # open-loop tilt. Fall back to the direct angle mapping, which
+                # is at least a known-bounded interpretation of the same input.
+                if not self._velocity_warned:
+                    logger.error(
+                        "velocity_control requested but no pose tracker; "
+                        "falling back to direct angle control"
+                    )
+                    self._velocity_warned = True
+            else:
+                vel = tracker.get_velocity()
+                yaw = tracker.get_yaw()
+                cy, sy = math.cos(yaw), math.sin(yaw)
+                # Drone-heading frame, matching GateChaseEnv._build_obs. Its y
+                # is LEFT-positive; the roll stick is right-positive, so flip.
+                v_fwd = vel[0] * cy + vel[1] * sy
+                v_right = -(-vel[0] * sy + vel[1] * cy)
+                vx_cmd = max(-1.0, min(1.0, self.throttle)) * self.max_forward_speed
+                vy_cmd = max(-1.0, min(1.0, self.roll)) * self.max_lateral_speed
+                pitch_cmd = (
+                    self.velocity_kp_fwd * (vx_cmd - v_fwd)
+                    + self.velocity_kff_fwd * vx_cmd
+                )
+                roll_cmd = (
+                    self.velocity_kp_lat * (vy_cmd - v_right)
+                    + self.velocity_kff_lat * vy_cmd
+                )
+        pitch_cmd = max(-1.0, min(1.0, pitch_cmd))
+        roll_cmd = max(-1.0, min(1.0, roll_cmd))
+        self.last_pitch_cmd = pitch_cmd
+        self.last_roll_cmd = roll_cmd
 
-        # CH2: pitch (forward tilt from throttle input)
-        channels[1] = int(max(1000, min(2000, 1500 + self.throttle * pitch_deflection)))
+        # CH1: roll (lateral bank)
+        channels[0] = int(max(1000, min(2000, 1500 + roll_cmd * roll_deflection)))
+
+        # CH2: pitch (forward tilt)
+        channels[1] = int(max(1000, min(2000, 1500 + pitch_cmd * pitch_deflection)))
 
         # CH3: motor throttle — bipolar around hover.
         alt = max(-1.0, min(1.0, self.altitude))
         alt_scaled = pow(abs(alt), self.throttle_scale) * (1 if alt >= 0 else -1)
 
-        # Altitude hold damper: when altitude stick is in deadband, bias throttle
-        # by -k * vz to counteract vertical drift.
+        # Altitude hold. Two modes, split by the command deadband:
+        #
+        #   |alt| >= deadband : an explicit climb/descent. Direct thrust, and the
+        #                       held height follows the drone (no hold applied).
+        #   |alt| <  deadband : hold mode. With altitude_hold_kp > 0 this is a PD
+        #                       regulator about a FROZEN setpoint, and the small
+        #                       command becomes a bounded position trim instead
+        #                       of raw thrust.
+        #
+        # Why the position term matters: a pure velocity damper (-K*vz) leaves the
+        # plant with no height regulation at all, so ANY steady thrust bias B
+        # settles at vz = B/K and integrates into the floor. A distilled BC
+        # student was measured at a -5 PWM bias (2.5% of full scale, invisible in
+        # val_loss) which sank it 1.4m in 30s, reliably fatal. With a position
+        # term the same bias produces a bounded offset of B/Kp instead.
         alt_hold_bias = 0
-        if self._pose_tracker is not None and self._pose_tracker.enabled:
-            if abs(alt) < self.altitude_hold_deadband:
-                vz = self._pose_tracker.get_vz()
-                alt_hold_bias = int(-self._pose_tracker.k_pwm * vz)
+        alt_thrust = alt_scaled * self.throttle_range
+        tracker = self._pose_tracker
+        direct = self._direct_thrust
+        if direct is not None:
+            # Explicit thrust command (takeoff / landing ramps). Bypasses the
+            # hold exactly the way an over-deadband stick used to, including the
+            # power curve, so the calibrated takeoff ramp behaves identically.
+            d = max(-1.0, min(1.0, float(direct)))
+            d_scaled = pow(abs(d), self.throttle_scale) * (1 if d >= 0 else -1)
+            alt_thrust = d_scaled * self.throttle_range
+            alt_hold_bias = 0
+            if tracker is not None and tracker.enabled:
+                self._alt_setpoint = tracker.latest[2]
+        elif (
+            self.velocity_control
+            and tracker is not None
+            and tracker.enabled
+            and self.altitude_hold_kp > 0.0
+        ):
+            # Velocity mode: the altitude input is a LINEAR height trim over the
+            # whole axis. No deadband and no power curve, which is the point --
+            # sign(a)*|a|**0.2 is near-vertical at zero (alt=-0.0001 was already
+            # -15.8 PWM), so tiny regression errors became large thrust errors.
+            # Here the same error is a proportional, bounded height offset.
+            z = tracker.latest[2]
+            if self._alt_setpoint is None:
+                self._alt_setpoint = z
+            z_target = self._alt_setpoint + alt * self.altitude_trim_range
+            alt_hold_bias = int(
+                -self.altitude_hold_kp * (z - z_target)
+                - tracker.k_pwm * tracker.get_vz()
+            )
+            alt_thrust = 0.0
+        elif tracker is not None and tracker.enabled:
+            in_hold = abs(alt) < self.altitude_hold_deadband
+            if not in_hold:
+                # Commanded climb/descent: let it fly, and re-anchor the hold to
+                # wherever it ends up.
+                self._alt_setpoint = tracker.latest[2]
+            elif self.altitude_hold_kp > 0.0:
+                z = tracker.latest[2]
+                if self._alt_setpoint is None:
+                    self._alt_setpoint = z
+                # The in-deadband command trims the target height rather than
+                # adding thrust, so a constant command cannot integrate.
+                z_target = self._alt_setpoint + alt_scaled * self.altitude_trim_range
+                alt_hold_bias = int(
+                    -self.altitude_hold_kp * (z - z_target)
+                    - tracker.k_pwm * tracker.get_vz()
+                )
+                alt_thrust = 0.0
+            else:
+                # Legacy behaviour: velocity damper only, command adds thrust.
+                alt_hold_bias = int(-tracker.k_pwm * tracker.get_vz())
         alt_hold_bias = max(-200, min(200, alt_hold_bias))
 
         steer = max(-1.0, min(1.0, self.steering))
@@ -394,9 +570,13 @@ class DroneGymEnv(gym.Env):
             yaw_ff_bias = -int(self.yaw_throttle_feedforward)
         yaw_ff_bias = max(-200, min(0, yaw_ff_bias))
 
+        # Keyed off the commanded TILT, not self.throttle, which is a speed
+        # setpoint in velocity mode. In velocity mode the hold is always active
+        # (no deadband on the trim axis), so the tilt compensation always applies.
         pitch_ff_bias = 0
-        if self.pitch_throttle_feedforward > 0 and abs(alt) < self.altitude_hold_deadband:
-            pitch_ff_bias = int(self.pitch_throttle_feedforward * abs(self.throttle))
+        ff_active = self.velocity_control or abs(alt) < self.altitude_hold_deadband
+        if self.pitch_throttle_feedforward > 0 and direct is None and ff_active:
+            pitch_ff_bias = int(self.pitch_throttle_feedforward * abs(pitch_cmd))
         pitch_ff_bias = max(0, min(200, pitch_ff_bias))
 
         throttle_pwm = int(
@@ -405,7 +585,7 @@ class DroneGymEnv(gym.Env):
                 min(
                     2000,
                     self.hover_throttle
-                    + alt_scaled * self.throttle_range
+                    + alt_thrust
                     + alt_hold_bias
                     + yaw_ff_bias
                     + pitch_ff_bias,
@@ -438,73 +618,6 @@ class DroneGymEnv(gym.Env):
         self.last_mode_pwm = channels[self.mode_channel]
 
         return channels
-
-    def step(self, action):
-        """Standard Gymnasium step function for RL training."""
-        # Action is usually a numpy array from SB3
-        self.steering, self.throttle, self.roll, self.altitude = action.flatten().tolist()
-        
-        time.sleep(1.0 / 30.0) # Wait for simulation step
-
-        # Pull latest telemetry from background simulation feed
-        if getattr(self, "_sim_telemetry", None) is not None:
-            self.position = self._sim_telemetry.position
-            self.attitude = self._sim_telemetry.attitude
-            self.velocity = self._sim_telemetry.velocity
-            self.imu = self._sim_telemetry.imu
-        
-        # 3. Calculate Reward
-        reward = 0.0
-        done = False
-        
-        # Penalty for crashing or flying too high/low
-        if self.position[2] < 0.2 or self.position[2] > 10.0:
-            reward = -10.0
-            done = True
-        else:
-            # Reward for progress toward target
-            current_pos = np.array(self.position)
-            dist_to_target = np.linalg.norm(current_pos - self._target_pos)
-            
-            if self._prev_pos is not None:
-                prev_dist = np.linalg.norm(self._prev_pos - self._target_pos)
-                reward += (prev_dist - dist_to_target) * 5.0 # Reward moving closer
-            
-            self._prev_pos = current_pos
-            
-            # Small penalty for high angular rates (prevent spinning)
-            reward -= np.linalg.norm(self.imu[3:]) * 0.01
-
-        # Stable Baselines3/PyTorch expects CHW format
-        obs_image = np.transpose(self.frame, (2, 0, 1)).astype(np.uint8)
-
-        obs = {
-            "image": obs_image,
-            "imu": np.array(self.imu, dtype=np.float32).flatten(),
-            "velocity": np.array(self.velocity, dtype=np.float32).flatten()
-        }
-        
-        return obs, reward, done, False, {}
-
-    def reset(self, seed=None, options=None):
-        """Standard Gymnasium reset."""
-        super().reset(seed=seed)
-        self._do_reset()
-        time.sleep(1.0) # Wait for Gazebo to settle
-        
-        # Pull latest telemetry
-        if getattr(self, "_sim_telemetry", None) is not None:
-            self.position = self._sim_telemetry.position
-            self.attitude = self._sim_telemetry.attitude
-            self.velocity = self._sim_telemetry.velocity
-            self.imu = self._sim_telemetry.imu
-
-        obs = {
-            "image": np.transpose(self.frame, (2, 0, 1)).astype(np.uint8),
-            "imu": np.array(self.imu, dtype=np.float32).flatten(),
-            "velocity": np.array(self.velocity, dtype=np.float32).flatten()
-        }
-        return obs, {}
 
     def _query_arming_flags(self, timeout=0.5):
         """Query MSP_STATUS_EX and return BF's arming-disable + active-mode state.
@@ -698,7 +811,7 @@ class DroneGymEnv(gym.Env):
 
         if self.altitude_hold_enabled:
             logger.info("Subscribing to pose topic for altitude hold...")
-            if not init_pose_subscriber():
+            if not init_pose_subscriber(self.gz_world):
                 logger.warning("Pose subscription failed, altitude hold disabled")
                 self._pose_tracker = None
 
@@ -712,36 +825,88 @@ class DroneGymEnv(gym.Env):
         except Exception as e:
             logger.error("BetaFlight loop error: %s", e)
 
-    def _do_reset(self):
-        """Teleport the drone back to spawn position via gz-transport set_pose_vector."""
-        try:
-            from gz.transport13 import Node
-            from gz.msgs10.pose_v_pb2 import Pose_V
-            from gz.msgs10.boolean_pb2 import Boolean
+    def set_altitude_setpoint(self, z):
+        """Anchor the altitude hold at a specific height (metres).
 
-            node = Node()
-            pose_msg = Pose_V()
-            p = pose_msg.pose.add()
-            p.name = self.gz_model_name
-            p.position.x = 0.0
-            p.position.y = 0.0
-            p.position.z = 0.5
-            p.orientation.w = 1.0
-            result, _reply = node.request(
-                f"/world/{self.gz_world}/set_pose_vector",
-                pose_msg,
-                type(pose_msg),
-                Boolean,
-                1000,
+        Takeoff routines need a REPEATABLE episode start height. Left alone the
+        hold freezes wherever the climb happens to be when the command re-enters
+        the deadband, and climb momentum makes that vary by ~1m run to run.
+        Requires DRONE_ALTITUDE_HOLD_KP > 0; a no-op otherwise.
+        """
+        self._alt_setpoint = float(z)
+
+    def get_altitude_setpoint(self):
+        return self._alt_setpoint
+
+    def _do_reset(self):
+        """Teleport the drone back to spawn_pose via a gz_reset_worker subprocess.
+
+        The set_pose_vector request is made from a fresh helper process rather
+        than in-process: gz-transport service requests from a process with
+        torch loaded time out reliably (same conflict that puts the camera in
+        gz_camera_worker), and enough timed-out in-process requests wedge the
+        server's service handler for everyone. Fire-and-forget; callers verify
+        the pose via telemetry and re-request if it didn't stick.
+        """
+        try:
+            x, y, z, yaw = self.spawn_pose
+            proc = self._gz_reset_worker()
+            if proc is None:
+                return
+            proc.stdin.write(f"{float(x)} {float(y)} {float(z)} {float(yaw)}\n")
+            proc.stdin.flush()
+            # Drop the velocity estimators' previous sample: otherwise the
+            # position jump reads as a huge phantom velocity and the altitude
+            # damper reacts to a movement that never happened.
+            if self._pose_tracker is not None:
+                self._pose_tracker.reset_history()
+            if getattr(self, "_sim_telemetry", None) is not None:
+                self._sim_telemetry.reset_history()
+            # Forget the held height too: a setpoint from the previous episode
+            # would make the hold fight the new spawn altitude.
+            self._alt_setpoint = None
+            logger.info(
+                "Reset requested: %s -> (%.2f, %.2f, %.2f, yaw=%.2f)",
+                self.gz_model_name, x, y, z, yaw,
             )
-            if result:
-                logger.info("Drone pose reset to origin (world=%s model=%s)",
-                            self.gz_world, self.gz_model_name)
-            else:
-                logger.warning("Reset pose request failed for %s/%s",
-                               self.gz_world, self.gz_model_name)
         except Exception as e:
             logger.error("Reset pose error: %s", e)
+
+    def _gz_reset_worker(self):
+        """Return the persistent reset worker, starting/restarting as needed."""
+        proc = getattr(self, "_gz_reset_proc", None)
+        if proc is not None and proc.poll() is None:
+            return proc
+        if proc is not None:
+            logger.warning("Reset worker exited (rc=%s); restarting", proc.poll())
+
+        worker = str(Path(__file__).parent / "gz_reset_worker.py")
+        log_path = Path(__file__).parent.parent / "logs" / "gz_reset_worker.log"
+        log_path.parent.mkdir(exist_ok=True)
+        self._gz_reset_log = open(log_path, "a")
+        self._gz_reset_proc = subprocess.Popen(
+            [
+                "uv", "run", "--env-file", ".env", "python", worker,
+                self.gz_world, self.gz_model_name, "--serve",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=self._gz_reset_log,
+            stderr=self._gz_reset_log,
+            text=True,
+            env=os.environ.copy(),
+        )
+        logger.info("Reset worker started (PID %d)", self._gz_reset_proc.pid)
+        return self._gz_reset_proc
+
+    def set_altitude_hold(self, enabled):
+        """Enable/disable the vertical damper at runtime.
+
+        Callers that teleport the drone should switch this off first: the
+        damper reacts to the resulting fall with near-max throttle, which
+        turns a reset into a runaway climb.
+        """
+        if self._pose_tracker is not None:
+            self._pose_tracker.enabled = bool(enabled)
 
     def update_flight_config(self, config_update):
         """Apply runtime-editable flight config values from the web UI."""
@@ -780,6 +945,7 @@ class DroneGymEnv(gym.Env):
         user_reset=None,
         web_reset=None,
         config_update=None,
+        direct_thrust=None,
     ):
         """
         Called by the DonkeyCar Vehicle loop each frame.
@@ -793,6 +959,10 @@ class DroneGymEnv(gym.Env):
         :param user_reset: optional bool. True = one-shot pose reset from LT.
         :param web_reset: optional bool. True = one-shot pose reset from web UI.
         :param config_update: optional runtime flight config update from web UI.
+        :param direct_thrust: optional raw thrust command in [-1, 1], bypassing
+                              the altitude hold. Takeoff and landing ramps need
+                              real thrust; in velocity mode the `altitude`
+                              argument is a height trim and cannot provide it.
         :return: camera image array + optional telemetry values
         """
         self.update_flight_config(config_update)
@@ -829,6 +999,7 @@ class DroneGymEnv(gym.Env):
         self.throttle = float(throttle)
         self.roll = float(roll)
         self.altitude = float(altitude)
+        self._direct_thrust = None if direct_thrust is None else float(direct_thrust)
         self.user_arm = user_arm if isinstance(user_arm, bool) else None
         if self.user_arm is True and self._prev_user_arm is not True:
             self._explicit_arm_started_at = time.time()
@@ -921,6 +1092,23 @@ class DroneGymEnv(gym.Env):
             except subprocess.TimeoutExpired:
                 self._camera_proc.kill()
             self._camera_proc = None
+        reset_proc = getattr(self, "_gz_reset_proc", None)
+        if reset_proc is not None:
+            logger.info("Terminating reset worker (PID %d)...", reset_proc.pid)
+            try:
+                reset_proc.stdin.close()
+            except Exception:
+                pass
+            reset_proc.terminate()
+            try:
+                reset_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                reset_proc.kill()
+            self._gz_reset_proc = None
+            log = getattr(self, "_gz_reset_log", None)
+            if log is not None:
+                log.close()
+                self._gz_reset_log = None
         if self._shm is not None:
             self._shm.close()
             try:

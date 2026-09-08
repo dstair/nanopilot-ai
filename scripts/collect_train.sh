@@ -112,7 +112,7 @@ if [ -n "$MAX_EPOCHS" ]; then
     TRAIN_ARGS+=("--max-epochs=$MAX_EPOCHS")
 fi
 
-uv run --env-file .env python nanopilot/torch_train.py "${TRAIN_ARGS[@]}" | tee "$TRAIN_LOG"
+uv run --env-file .env python -u nanopilot/torch_train.py "${TRAIN_ARGS[@]}" | tee "$TRAIN_LOG"
 
 echo "Collected tub: $TUB_PATH"
 echo "Model: $MODEL_PATH"

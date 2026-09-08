@@ -67,16 +67,24 @@ class ResidualBlock(nn.Module):
 
 
 class LinearModel(nn.Module):
-    def __init__(self, input_shape=(3, 120, 160), imu_shape=(3, 6)):
+    def __init__(self, input_shape=(3, 120, 160), imu_shape=(3, 6), vel_dim=3):
         """
         Args:
             input_shape: (C, H, W) image dimensions.
             imu_shape: (Sequence Length, Channels) e.g., (3, 6) for 3 steps of [accel, gyro].
+            vel_dim: heading-frame velocity channels (3). The RL teacher's
+                altitude control is velocity feedback (GateChaseEnv obs[5:8]),
+                and vz is NOT recoverable from a single camera frame plus a few
+                accelerometer samples -- so without this input the student
+                cannot represent the policy it is cloning, and oscillates
+                vertically into the ground no matter how good the label fit is.
         """
         super().__init__()
 
         self.vis_feat_dim = 256
         self.imu_hidden_dim = 32
+        self.vel_hidden_dim = 32
+        self.vel_dim = vel_dim
 
         # Initial feature extraction
         self.init_conv = nn.Sequential(
@@ -99,8 +107,14 @@ class LinearModel(nn.Module):
         self.imu_gru = nn.GRU(input_size=imu_shape[1], hidden_size=self.imu_hidden_dim,
                               num_layers=1, batch_first=True)
 
-        # Prediction head: concatenated vision + IMU features -> 4 controls.
-        fused_dim = self.vis_feat_dim + self.imu_hidden_dim
+        # Velocity branch: instantaneous, so a small MLP rather than a GRU.
+        self.vel_fc = nn.Sequential(
+            nn.Linear(vel_dim, self.vel_hidden_dim),
+            nn.GELU(),
+        )
+
+        # Prediction head: concatenated vision + IMU + velocity features -> 4 controls.
+        fused_dim = self.vis_feat_dim + self.imu_hidden_dim + self.vel_hidden_dim
         self.fc = nn.Sequential(
             nn.Linear(fused_dim, 128),
             nn.GELU(),
@@ -110,7 +124,7 @@ class LinearModel(nn.Module):
             nn.Linear(64, 4)
         )
 
-    def forward(self, img, imu):
+    def forward(self, img, imu, vel):
         # Image branch
         x = self.init_conv(img)
         x = self.layer1(x)
@@ -124,5 +138,7 @@ class LinearModel(nn.Module):
         _, h_n = self.imu_gru(imu)
         imu_feat = h_n[-1]  # (Batch, imu_hidden_dim)
 
-        fused = torch.cat([vis_feat, imu_feat], dim=1)
+        vel_feat = self.vel_fc(vel)
+
+        fused = torch.cat([vis_feat, imu_feat, vel_feat], dim=1)
         return self.fc(fused)

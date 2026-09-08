@@ -111,8 +111,11 @@ echo "Starting BetaFlight SITL: $BETAFLIGHT_BIN (log: $BF_LOG)..."
 # Reusable launcher — called again after a CLI eeprom save so the running BF
 # loads fresh values from disk and comes up with a clean arming-flag state.
 start_betaflight() {
-    # BetaFlight SITL on macOS ARM64 sometimes crashes on first launch (SIGTRAP), but works on retry
-    for attempt in 1 2; do
+    # BetaFlight SITL on macOS ARM64 intermittently aborts during TCP serial
+    # init (heap corruption in openSerialPort/stream_initAddress). Random per
+    # launch, so retry generously.
+    local max_attempts=5
+    for attempt in $(seq 1 "$max_attempts"); do
         > "$BF_LOG"
         # Removed gstdbuf to avoid DYLD_INSERT_LIBRARIES SIGTRAP on Apple Silicon
         "$BETAFLIGHT_BIN" > "$BF_LOG" 2>&1 &
@@ -122,11 +125,11 @@ start_betaflight() {
             echo "BetaFlight SITL running (PID $BF_PID)."
             return 0
         fi
-        if [ $attempt -eq 1 ]; then
-            echo "BetaFlight crashed on attempt 1, retrying..."
-            sleep 1
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            echo "BetaFlight crashed on attempt $attempt, retrying..."
+            sleep 2
         else
-            echo "ERROR: BetaFlight SITL died on both attempts. Check $BF_LOG"
+            echo "ERROR: BetaFlight SITL died on all $max_attempts attempts. Check $BF_LOG"
             exit 1
         fi
     done
@@ -139,11 +142,13 @@ start_betaflight
 # eeprom values, the script exits 42 → we kill and relaunch BF so the new
 # values load from disk, then re-run (the 2nd pass finds values already
 # match and proceeds to mode/failsafe setup).
-for cfg_attempt in 1 2; do
+# Up to 3 passes: a fresh eeprom needs (1) airmode disable + restart,
+# (2) CLI mixer/PID apply + restart, (3) clean MSP-only mode/failsafe setup.
+for cfg_attempt in 1 2 3; do
 # `set +e` so the intentional exit 42 from the config script doesn't trip
 # `set -e` before we can check the return code.
 set +e
-SKIP_CLI_PROBE="$([ "$cfg_attempt" = "2" ] && echo 1 || echo 0)" \
+SKIP_CLI_PROBE="$([ "$cfg_attempt" = "3" ] && echo 1 || echo 0)" \
 AIRFRAME="$AIRFRAME" python3 -c "
 import socket, time, struct, sys, os
 SKIP_CLI = os.environ.get('SKIP_CLI_PROBE') == '1'
@@ -216,16 +221,13 @@ if len(feat) >= 4:
         msp_send(s, 37, struct.pack('<I', new_feat))  # MSP_SET_FEATURE_CONFIG
         msp_send(s, 250)  # MSP_EEPROM_WRITE
         print('  Features: 0x%08x -> 0x%08x (AIRMODE disabled), saved to eeprom' % (current, new_feat))
-        # MSP_REBOOT (68) — BF restarts internally, socket dies
-        try:
-            frame = b'\$M<' + bytes([0, 68, 68])
-            s.send(frame)
-        except OSError:
-            pass
+        # Restart via the shell (exit 42). The old in-process MSP_REBOOT (68)
+        # left this SITL build's CLI permanently deaf afterwards — the '#'
+        # trigger got no prompt and every CLI get/set silently no-opped
+        # (2026-08-23), which is how fresh eeproms ended up flying on stock
+        # PIDs and the LEGACY mixer.
         s.close()
-        time.sleep(1.5)
-        s = connect_msp()
-        print('  Reconnected after reboot')
+        sys.exit(42)
     else:
         print('  Features: 0x%08x (AIRMODE already disabled)' % current)
 else:
@@ -265,6 +267,19 @@ if AIRFRAME == '65mm':
 else:
     YAW_PID = {'p_yaw': '20', 'i_yaw': '10', 'd_yaw': '0', 'f_yaw': '20'}
 
+# Pitch/roll rate PIDs: same failure mode as yaw (found 2026-08-23). Stock
+# gains limit-cycle bang-bang in SITL — the front/rear motor pairs slam
+# between ~1086 and ~1906 PWM while attitude stays level — and the omega^2
+# mixer asymmetry rectifies that oscillation into phantom collective thrust
+# (up to +7 m/s^2), making the drone climb away at neutral throttle no matter
+# what CH3 commands. Low gains collapse the split to ~30 PWM and thrust
+# becomes a clean function of throttle again.
+PID_GAINS = dict(YAW_PID)
+PID_GAINS.update({
+    'p_pitch': '20', 'i_pitch': '10', 'd_pitch': '0', 'f_pitch': '20',
+    'p_roll': '20', 'i_roll': '10', 'd_roll': '0', 'f_roll': '20',
+})
+
 # CLI phase. Probing via CLI latches BF's CLI arming-disable flag on the
 # running SITL — MSP_REBOOT doesn't reliably re-init the MSP service on this
 # SITL build, so the only way to clear the flag is to kill and restart.
@@ -274,8 +289,29 @@ if not SKIP_CLI:
     # Send '#' only (no CR/LF) — the byte itself is the mode-switch trigger;
     # a trailing newline gets interpreted as an empty command and can race
     # with the prompt being drawn.
-    s.sendall(b'#')
-    banner = cli_drain(s, timeout=1.5, match=b'# ')
+    # Right after boot (or the airmode-disable reboot above) the CLI can be
+    # deaf for a moment: the '#' lands, nothing comes back, and every
+    # subsequent get/set silently does nothing (2026-08-23: this left stock
+    # PIDs + LEGACY mixer on a fresh eeprom while the log claimed success).
+    # Retry entry until a prompt actually appears, reconnecting between
+    # attempts, and hard-fail if the CLI never answers.
+    banner = b''
+    for cli_attempt in range(5):
+        time.sleep(0.5)
+        s.sendall(b'#')
+        banner = cli_drain(s, timeout=2.0, match=b'# ')
+        if b'#' in banner:
+            break
+        print('  CLI entry attempt %d: no prompt, reconnecting...' % (cli_attempt + 1))
+        try:
+            s.close()
+        except OSError:
+            pass
+        time.sleep(1.0)
+        s = connect_msp()
+    else:
+        print('  ERROR: BetaFlight CLI never produced a prompt; aborting launch')
+        sys.exit(1)
     print('  CLI banner: %r' % banner[-80:])
 
     s.sendall(b'get mixer_type\r\n')
@@ -285,13 +321,13 @@ if not SKIP_CLI:
     mixer_ok = b'mixer_type = LINEAR' in mixer_resp
     print('  probe mixer_type: %r' % mixer_resp[:160])
 
-    yaw_ok = True
-    for k, v in YAW_PID.items():
+    pid_ok = True
+    for k, v in PID_GAINS.items():
         s.sendall(('get ' + k + '\r\n').encode())
         r = cli_drain(s, timeout=1.5, match=b'# ')
         print('  probe %s: %r' % (k, r[:160]))
         if ('= ' + v).encode() not in r:
-            yaw_ok = False
+            pid_ok = False
 
     # Mode bindings:
     #   slot 0: ARM   on AUX1 (channel idx 0), range [1700, 2100]
@@ -313,26 +349,34 @@ if not SKIP_CLI:
         if needle not in aux_resp:
             aux_ok = False
 
-    if mixer_ok and yaw_ok and aux_ok:
+    if mixer_ok and pid_ok and aux_ok:
         print('  CLI: values already at target, no save needed')
     else:
         if not mixer_ok:
             s.sendall(b'set mixer_type = LINEAR\r\n')
             cli_drain(s, timeout=1.5, match=b'# ')
-        if not yaw_ok:
-            for k, v in YAW_PID.items():
+        if not pid_ok:
+            for k, v in PID_GAINS.items():
                 s.sendall(('set ' + k + ' = ' + v + '\r\n').encode())
                 cli_drain(s, timeout=1.5, match=b'# ')
         if not aux_ok:
             for slot, expected in AUX_BINDINGS:
                 s.sendall(('aux ' + slot + ' ' + expected + '\r\n').encode())
                 cli_drain(s, timeout=1.5, match=b'# ')
+        # Verify one representative value actually took before saving — a
+        # deaf CLI accepts writes into the void and we must not report
+        # success (or save) on top of that.
+        s.sendall(b'get p_pitch\r\n')
+        verify = cli_drain(s, timeout=2.0, match=b'# ')
+        if ('= ' + PID_GAINS['p_pitch']).encode() not in verify:
+            print('  ERROR: CLI set did not stick (p_pitch probe: %r); aborting launch' % verify[:120])
+            sys.exit(1)
         # 'save noreboot' persists to eeprom.bin WITHOUT exiting the SITL
         # process. (Bare 'save' issues a reset that kills SITL on macOS —
         # the CLI reboot path is exit(), not a warm restart.)
         s.sendall(b'save noreboot\r\n')
         cli_drain(s, timeout=2.0, match=b'# ')
-        print('  CLI: applied mixer_type=LINEAR + yaw PIDs %s + aux bindings, saved noreboot' % YAW_PID)
+        print('  CLI: applied mixer_type=LINEAR + PID gains %s + aux bindings, saved noreboot' % PID_GAINS)
 
     s.close()
     print('  Exiting to restart BetaFlight (clears CLI arming flag)')
@@ -384,7 +428,7 @@ s.close()
     cfg_rc=$?
     set -e
     if [ "$cfg_rc" = "42" ]; then
-        if [ "$cfg_attempt" = "1" ]; then
+        if [ "$cfg_attempt" != "3" ]; then
             echo "Restarting BetaFlight SITL to load saved eeprom..."
             kill -9 "$BF_PID" 2>/dev/null || true
             wait "$BF_PID" 2>/dev/null || true

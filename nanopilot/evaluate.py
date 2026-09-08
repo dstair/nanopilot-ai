@@ -138,7 +138,10 @@ def checkpoint_kind(state_dict):
         # Current vision+IMU model and the legacy GRU model share layer names;
         # they differ only in the output width (4 controls vs the old 3).
         out_dim = state_dict["fc.5.weight"].shape[0] if "fc.5.weight" in state_dict else 4
-        return "legacy_imu_gru" if out_dim == 3 else "current"
+        if out_dim == 3:
+            return "legacy_imu_gru"
+        # 4-output models split again on the velocity input (added 2026-09-01).
+        return "current" if "vel_fc.0.weight" in state_dict else "pre_velocity"
     return "unknown"
 
 
@@ -149,6 +152,13 @@ def load_model(model_path, device, input_shape, imu_shape):
         model = LegacyImuFcLinearModel(input_shape=input_shape, imu_shape=imu_shape)
     elif kind == "legacy_imu_gru":
         model = LegacyImuGruLinearModel(input_shape=input_shape, imu_shape=imu_shape)
+    elif kind == "pre_velocity":
+        raise RuntimeError(
+            f"{model_path} is a 4-output checkpoint from before the velocity "
+            "input was added (no vel_fc weights). The teacher's altitude control "
+            "is velocity feedback, which those models could not observe. "
+            "Retrain with torch_train.py."
+        )
     elif kind == "control_feedback":
         raise RuntimeError(
             f"{model_path} is a retired control-feedback/attention checkpoint "
@@ -225,8 +235,12 @@ def evaluate_model(
     all_preds = []
     all_targets = []
     with torch.no_grad():
-        for images, imus, targets in loader:
-            outputs = model(images.to(device), imus.to(device))
+        for images, imus, vels, targets in loader:
+            # Legacy checkpoints predate the velocity input and take (img, imu).
+            if kind == "current":
+                outputs = model(images.to(device), imus.to(device), vels.to(device))
+            else:
+                outputs = model(images.to(device), imus.to(device))
             all_preds.append(outputs.cpu().numpy())
             all_targets.append(targets.numpy())
 

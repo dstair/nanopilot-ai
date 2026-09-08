@@ -155,7 +155,7 @@ def collect(cfg, args):
     finally:
         if tub_writer is not None:
             tub_writer.shutdown()
-        env.run_threaded(0.0, 0.0, 0.0, -1.0)
+        env.run_threaded(0.0, 0.0, 0.0, 0.0, direct_thrust=-1.0)
         time.sleep(0.5)
         env.shutdown()
         update_thread.join(timeout=3.0)

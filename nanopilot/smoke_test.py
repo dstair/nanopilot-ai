@@ -32,6 +32,7 @@ def run_smoke_test():
     # Vision Input: (B, 3, H, W) | IMU Input: (B, Seq, 6)
     dummy_input = torch.randn(batch_size, 3, image_h, image_w).to(device)
     dummy_imu = torch.randn(batch_size, imu_seq_len, 6).to(device)
+    dummy_vel = torch.randn(batch_size, 3).to(device)
     # Labels: (B, 4) -> [yaw, pitch, roll, altitude]
     dummy_labels = torch.randn(batch_size, 4).to(device)
 
@@ -42,7 +43,7 @@ def run_smoke_test():
     
     for i in range(10):
         optimizer.zero_grad()
-        outputs = model(dummy_input, dummy_imu)
+        outputs = model(dummy_input, dummy_imu, dummy_vel)
         loss = criterion(outputs, dummy_labels)
         loss.backward()
         optimizer.step()

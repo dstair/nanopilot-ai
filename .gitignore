@@ -17,3 +17,9 @@ models/
 data/
 eeprom.bin
 PLAN-*
+
+# Node (stray; not part of this project)
+node_modules/
+
+# Per-machine Claude Code permissions
+.claude/settings.local.json

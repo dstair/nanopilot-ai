@@ -39,13 +39,30 @@ Camera mode (set `DRONE_CAMERA_SOURCE` in your `nanopilot/drone_config_XXmm.py`)
   on a gz-transport topic. GPU-accelerated via Metal/OpenGL; this was key for performance.
 
 **Semantic mapping (DonkeyCar key name → Drone flight axis):**
-- `steering [-1, 1]` → **yaw** rate (turn left/right)
-- `throttle [-1, 1]` → **forward pitch** (tilt forward/backward)
-- `roll [-1, 1]`     → **lateral roll** (bank left/right)
-- `altitude [-1, 1]` → **motor throttle** (climb/descend). Direct power control — no PID, matching real BetaFlight behavior for CNN transferability.
 
-Since memory key names are identical to the car version, the web controller,
-CNN model (LinearModel), training pipeline, and data recording all work unchanged.
+The four key names are fixed, but what the values MEAN depends on
+`DRONE_VELOCITY_CONTROL` (on for the 80mm airframe since 2026-09-06):
+
+| key | velocity mode (current) | direct mode (`DRONE_VELOCITY_CONTROL=False`) |
+| --- | --- | --- |
+| `steering [-1, 1]` | **yaw rate** (unchanged) | **yaw rate** |
+| `throttle [-1, 1]` | **forward speed**, fraction of `DRONE_MAX_FORWARD_SPEED` | **forward pitch** angle |
+| `roll [-1, 1]` | **rightward speed**, fraction of `DRONE_MAX_LATERAL_SPEED` | **lateral roll** angle |
+| `altitude [-1, 1]` | **height trim**, linear, in metres of `DRONE_ALTITUDE_TRIM_RANGE` | **motor throttle** around hover, via a `\|a\|**0.2` curve |
+
+In velocity mode the environment closes the inner loop (a P+feed-forward
+cascade on measured velocity, plus a PD altitude hold), so the learned policy
+emits setpoints rather than calibrated thrust and tilt. That change exists
+because a 5 PWM altitude bias — 2.5% of full scale, invisible in validation
+loss — was enough to fly a distilled model into the floor when the altitude
+axis was raw thrust.
+
+Takeoff and landing ramps still need raw thrust and pass it explicitly as
+`run_threaded(..., direct_thrust=X)`, which bypasses the hold.
+
+Since the key names are identical to the car version, the web controller,
+CNN model (LinearModel), training pipeline, and data recording all work
+unchanged across both modes.
 
 ## Prerequisites
 
@@ -199,6 +216,32 @@ To fly the autopilot model created in the previous step:
 
 In the Web UI, switch to "local_angle" or "local" mode. You can always switch back.
 
+### Automated testing of NanoPilot
+
+eval_flight.py loads TorchPilot, resets to the a standard start pose, lets the model fly for N seconds, and scores from gz_telemetry pose data. Metrics that work with zero human judgment:
+  - survival time until crash (z below threshold, or attitude beyond ±60°),
+  - progress: distance traveled along the corridor axis (landing_target) or gates passed (gate positions are known from the SDF — count aperture plane-crossings),
+  - cross-track error and altitude deviation along the way.
+
+Run 3-5 runs; it emits JSON per run; the result is a scoreboard. 
+
+The end to end flow is: collect (human, occasionally) → train → evaluate.py → eval_flight.py → compare JSON. Everything after "collect" runs unattended with GZ_HEADLESS=1.
+
+The script `eval_flight.sh` can conduct an automated evaluation of a given model. Try training in a simple world like `landing_target_80mm` before progressing to the next level of difficulty, the gates (`slalom_gates_80mm`).
+
+`./scripts/eval_flight.sh --model=models/[MODEL_NAME].pth --runs=3`
+
+```bash
+=== eval_flight: models/bc_v4.pth on landing_target_80mm (line) ===
+  episodes: 3
+  success_rate: 0.0
+  crash_rate: 0.0
+  mean_survival_s: 0.0
+  mean_along_track_m: 0.0
+  mean_cross_track_m: 0.0
+JSON: /path/to/nanopilot-ai/nanopilot/../logs/eval_flight_20260713_140143.json
+```
+
 ## Configuration
 
 Two airframe configs are maintained side-by-side. Pick one with `--airframe=65mm|80mm` on `start.sh` (default `80mm`, the Pavo Pico II). Edit the matching `nanopilot/drone_config_XXmm.py` to adjust parameters:
@@ -213,6 +256,9 @@ Two airframe configs are maintained side-by-side. Pick one with `--airframe=65mm
 | `DRONE_MAX_PITCH_ANGLE` | 25.0 | Max forward pitch angle (degrees) |
 | `DRONE_MAX_ROLL_ANGLE` | pitch angle | Max lateral roll angle (degrees) |
 | `DRONE_MAX_YAW_RATE` | 90.0 | Max yaw rate (deg/s) at full steering |
+| `DRONE_VELOCITY_CONTROL` | False | Pitch/roll become speed setpoints, altitude a linear height trim |
+| `DRONE_MAX_FORWARD_SPEED` | 2.0 | Forward speed (m/s) at `throttle` = 1 |
+| `DRONE_MAX_LATERAL_SPEED` | 1.0 | Rightward speed (m/s) at `roll` = 1 |
 | `SIMULATED_DELAY_MS` | 0 | Simulated camera delay in ms (0=off) |
 | `MEASURE_LOOP_DELAY` | True | Log vehicle loop timing stats |
 | `DRIVE_LOOP_HZ` | 30 | Vehicle loop frequency |
@@ -262,6 +308,7 @@ macOS Host (Apple Silicon, ARM64)
 | `worlds/drone_course_65mm.sdf` | 65mm Air65 world (colored walls + Air65 model) |
 | `worlds/drone_course_80mm.sdf` | 80mm Pavo Pico II world (same course, 80mm model) |
 | `worlds/baylands_80mm.sdf` | Default 80mm Baylands world |
+| `worlds/landing_target_80mm.sdf` | most basic, for line following |
 
 ## Worlds for autopilot training
 

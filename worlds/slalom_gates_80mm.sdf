@@ -30,7 +30,16 @@
       </link>
     </model>
 
-    <!-- Zig-zagging Gates -->
+    <!-- Course: two near-straight gates along +x, then a 30-degree turn.
+         gate_1 (5, 2) and gate_2 (15, 2) sit on the same +x track line, so
+         the leg between them is a gentle correction rather than a slalom.
+         gate_3 is 6m from gate_2 at 30 degrees off that track line, to the
+         RIGHT (-y): the drone exits gate_2 aligned with its normal (+28.6
+         deg), so a right-hand offset is what actually demands a turn. It is
+         also the last gate, so nothing more centred competes with it for the
+         student's attention; the gate-2-skipping failure of 2026-09-06 was
+         a target-assignment problem, not a turn-radius one. Gate yaw matches
+         the leg bearing so the approach centerline points back at gate_2. -->
     <model name="gate_1">
       <static>true</static>
       <pose>5 2 1.5 0 0 0.5</pose>
@@ -45,7 +54,7 @@
 
     <model name="gate_2">
       <static>true</static>
-      <pose>10 -2 1.5 0 0 -0.5</pose>
+      <pose>15 2 1.5 0 0 0.5</pose>
       <link name="link">
         <visual name="v1"><pose>0 -1 0 0 0 0</pose><geometry><box><size>0.1 0.1 3</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
         <visual name="v2"><pose>0 1 0 0 0 0</pose><geometry><box><size>0.1 0.1 3</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
@@ -57,7 +66,7 @@
 
     <model name="gate_3">
       <static>true</static>
-      <pose>15 2 1.5 0 0 0.5</pose>
+      <pose>20.196 -1 1.5 0 0 -0.5236</pose>
       <link name="link">
         <visual name="v1"><pose>0 -1 0 0 0 0</pose><geometry><box><size>0.1 0.1 3</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
         <visual name="v2"><pose>0 1 0 0 0 0</pose><geometry><box><size>0.1 0.1 3</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>

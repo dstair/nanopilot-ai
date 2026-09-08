@@ -70,8 +70,18 @@ def build_drone_env(
         yaw_throttle_feedforward=getattr(cfg, "DRONE_YAW_THROTTLE_FEEDFORWARD", 0.0),
         pitch_throttle_feedforward=getattr(cfg, "DRONE_PITCH_THROTTLE_FEEDFORWARD", 0.0),
         altitude_hold_k=getattr(cfg, "DRONE_ALTITUDE_HOLD_K", 30.0),
+        altitude_hold_kp=getattr(cfg, "DRONE_ALTITUDE_HOLD_KP", 0.0),
+        altitude_trim_range=getattr(cfg, "DRONE_ALTITUDE_TRIM_RANGE", 0.0),
         altitude_hold_deadband=getattr(cfg, "DRONE_ALTITUDE_HOLD_DEADBAND", 0.05),
         altitude_hold_enabled=getattr(cfg, "DRONE_ALTITUDE_HOLD_ENABLED", True),
+        velocity_control=getattr(cfg, "DRONE_VELOCITY_CONTROL", False),
+        max_forward_speed=getattr(cfg, "DRONE_MAX_FORWARD_SPEED", 2.0),
+        max_lateral_speed=getattr(cfg, "DRONE_MAX_LATERAL_SPEED", 1.0),
+        velocity_kp_fwd=getattr(cfg, "DRONE_VELOCITY_KP_FWD", 0.6),
+        velocity_kff_fwd=getattr(cfg, "DRONE_VELOCITY_KFF_FWD", 0.35),
+        velocity_kp_lat=getattr(cfg, "DRONE_VELOCITY_KP_LAT", 1.2),
+        velocity_kff_lat=getattr(cfg, "DRONE_VELOCITY_KFF_LAT", 0.8),
+        velocity_tau=getattr(cfg, "DRONE_VELOCITY_TAU", 0.1),
         angle_mode=getattr(cfg, "DRONE_ANGLE_MODE", True),
         record_position=(
             getattr(cfg, "DRONE_RECORD_POSITION", False)
