@@ -53,7 +53,8 @@ def main():
                              "student reaches with no checkpoint to load.")
     parser.add_argument("--cruise-speed", type=float, default=1.5)
     parser.add_argument("--lookahead", type=float, default=3.0)
-    parser.add_argument("--height-gain", type=float, default=0.5)
+    parser.add_argument("--height-gain", type=float, default=0.75)
+    parser.add_argument("--height-lookahead", type=float, default=0.0)
     parser.add_argument("--student", required=True,
                         help="student .pth flown to generate the state distribution")
     parser.add_argument("--world", default="slalom_gates_80mm")
@@ -153,6 +154,7 @@ def main():
                 drone_env, gates,
                 cruise_speed=args.cruise_speed, lookahead=args.lookahead,
                 height_gain=args.height_gain,
+                height_lookahead=args.height_lookahead,
             )
             norm = teacher = None
             print(f"Expert labeller: cruise={args.cruise_speed} "

@@ -246,9 +246,14 @@ class GateChaseEnv(gym.Env):
             and self._prev_gate_lx < 0.0 <= lx
         )
         if crossed:
+            # Height window is PER GATE (parse_world measures it from the SDF)
+            # so it moves with a varied-height course; gate_z_min/max are only
+            # the fallback for gates that carry no window.
             through = (
                 abs(ly) <= self.gate_half_width
-                and self.gate_z_min <= z <= self.gate_z_max
+                and gate.get("z_min", self.gate_z_min)
+                <= z
+                <= gate.get("z_max", self.gate_z_max)
             )
             if through:
                 reward += self.pass_bonus

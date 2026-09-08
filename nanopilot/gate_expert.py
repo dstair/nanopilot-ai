@@ -23,19 +23,44 @@ Control law:
   for the expert: it keeps the gate inside the camera frame, so the distilled
   vision policy is learning a task whose target it can actually see.
 
-  Height is a proportional trim toward the gate height, and its gain is a
-  STABILITY constraint, not an accuracy one. The command shifts the setpoint of
-  a hold that is already a position regulator, so Kz wraps a second proportional
-  loop around a second-order plant: the closed loop becomes w' = w*sqrt(1+Kz),
-  zeta' = zeta/sqrt(1+Kz). Worse, the trim saturates at |error| > TRIM_RANGE/Kz,
-  and a saturated proportional loop is a relay, which limit-cycles.
+  Height is a FEED-FORWARD to the gate height plus a small proportional term.
+  The feed-forward is the part that matters and it follows directly from what
+  the axis means: under DRONE_VELOCITY_CONTROL the env holds height at
+  `setpoint + altitude * TRIM_RANGE`, so commanding
+  `(gate_z - setpoint) / TRIM_RANGE` asks for exactly the gate's height, with
+  no steady-state error. The setpoint is frozen at start_alt by every takeoff
+  path, so this is a constant per episode and the label stays a pure function
+  of the gate -- which is what makes it learnable by a memoryless student.
+
+  The proportional term only adds drive during the transient; it vanishes once
+  z reaches the gate height, so it costs no steady-state accuracy. Its gain is
+  a STABILITY constraint, not an accuracy one. The command shifts the setpoint
+  of a hold that is already a position regulator, so Kz wraps a second
+  proportional loop around a second-order plant: the closed loop becomes
+  w' = w*sqrt(1+Kz), zeta' = zeta/sqrt(1+Kz). Worse, the trim saturates at
+  |error| > TRIM_RANGE/Kz, and a saturated proportional loop is a relay, which
+  limit-cycles.
+
+  Kz = 0.75 is the validated default, chosen on s_curve_heights_80mm where the
+  axis is actually exercised: over 5 episodes Kz=0.5 passed 97% of crossings,
+  0.75 passed 98% with the smallest error tail (0.83m max), 1.0 passed 96% with
+  a 1.19m outlier, and 1.5 CRASHED 2 of 3 episodes. On a flat course the term
+  only ever sees the hold's ~0.1m residual, so the choice is worth ~2.5cm of
+  trim there and cannot matter.
 
   Measured 2026-09-06 at Kz=2.0: z oscillated 1.65 -> 2.48 -> 1.38 -> 3.01 ->
   1.11 -> 3.08 with the command pinned at -1.00/+0.80, i.e. a GROWING bang-bang
   limit cycle that flew the drone over the 3.0m gate ceiling. Kz=0.5 gives
-  zeta' = 0.67 and only saturates beyond 2m of error. Accuracy is not the
-  tradeoff it looks like: the settling point is (setpoint + Kz*gate_z)/(1+Kz),
-  and episodes anchor the setpoint at the gate height, so the residual is ~0.
+  zeta' = 0.67 and only saturates beyond 2m of error.
+
+  WITHOUT the feed-forward -- the law up to 2026-09-07 -- the settling point is
+  (setpoint + Kz*gate_z)/(1+Kz), i.e. Kz=0.5 leaves 67% of (gate_z - setpoint)
+  as permanent error. On the flat courses that was invisible, because the
+  setpoint IS the gate height there and the error is identically zero. On a
+  varied-height course it is fatal: a gate 0.9m above the setpoint would be
+  approached to within 0.6m and never reached. Pure-P behaviour is still what
+  you get if no setpoint is available (`altitude_setpoint_fn=None`), and on a
+  flat course the two laws are numerically identical.
 """
 
 import math
@@ -75,9 +100,11 @@ class GateExpert:
         lookahead=3.0,
         yaw_gain=1.5,
         max_yaw_rate_rad=None,
-        height_gain=0.5,
+        height_gain=0.75,
+        height_lookahead=0.0,
         align_slowdown=False,
         min_speed_frac=0.25,
+        altitude_setpoint_fn=None,
     ):
         if not gates:
             raise ValueError("GateExpert needs at least one gate")
@@ -94,8 +121,14 @@ class GateExpert:
         # Yaw rate at full stick, used to convert the desired rate into a stick.
         self.max_yaw_rate_rad = float(max_yaw_rate_rad or math.radians(120.0))
         self.height_gain = float(height_gain)
+        # Metres of LEAD applied to the height reference, to cancel loop lag.
+        # Zero means "track the course height at the drone's own position".
+        self.height_lookahead = float(height_lookahead)
         self.align_slowdown = bool(align_slowdown)
         self.min_speed_frac = float(min_speed_frac)
+        # Reads the env's frozen altitude hold setpoint. Called per step rather
+        # than cached because a reset clears it and takeoff re-pins it.
+        self.altitude_setpoint_fn = altitude_setpoint_fn
 
     @classmethod
     def from_env(cls, drone_env, gates, **kwargs):
@@ -106,8 +139,54 @@ class GateExpert:
             max_lateral_speed=getattr(drone_env, "max_lateral_speed", 1.0),
             altitude_trim_range=getattr(drone_env, "altitude_trim_range", 1.0),
             max_yaw_rate_rad=math.radians(getattr(drone_env, "max_yaw_rate", 120.0)),
+            altitude_setpoint_fn=getattr(drone_env, "get_altitude_setpoint", None),
             **kwargs,
         )
+
+    def _height_ref(self, gate_idx, lx):
+        """Height reference: the course height at the drone's own position.
+
+        The gates define a piecewise-linear height profile along the track, and
+        this evaluates it where the drone actually is, so the reference is a
+        continuous ramp that arrives at gate n's height exactly AT gate n. That
+        matters more than it sounds: a reference that simply jumps to the next
+        gate's height on each crossing is a square wave, and on the 2026-09-07
+        per-gate-step course the expert missed every crossing on height with
+        the drone swinging 0.2m to 3.9m.
+
+        `height_lookahead` then shifts that reference forward by a fixed
+        distance to cancel loop lag. Keep it SMALL. Measured in flight, the
+        hold tracks a 0.29 m/s ramp with almost no lag, so a 3m lead put the
+        drone 0.4-0.6m past every gate's height at the crossing -- the lead
+        error simply replaced the lag error.
+
+        :param gate_idx: index of the gate being chased
+        :param lx: drone position along the gate normal (negative on approach)
+        """
+        n = len(self.gates)
+        i = min(gate_idx, n - 1)
+        # Distance still to run to the gate plane, shifted forward by the lead.
+        d = -lx - self.height_lookahead
+        if d <= 0.0:
+            # The lead has carried the reference past this gate; ramp on toward
+            # the next one. At the last gate there is nothing to ramp toward.
+            if i + 1 >= n:
+                return self.gates[i]["z"]
+            a, b = self.gates[i], self.gates[i + 1]
+            f = -d
+        else:
+            # Still on the leg into this gate. Before the first gate there is no
+            # previous leg, so hold its height (which is start_alt by design).
+            if i == 0:
+                return self.gates[0]["z"]
+            a, b = self.gates[i - 1], self.gates[i]
+            span = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+            f = span - d
+        span = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+        if span < 1e-6:
+            return b["z"]
+        t = min(1.0, max(0.0, f / span))
+        return a["z"] + t * (b["z"] - a["z"])
 
     def act(self, pos, yaw_rad, gate_idx):
         """Return [steering, throttle, roll, altitude] for the current state.
@@ -161,7 +240,17 @@ class GateExpert:
         roll = v_right / self.max_lateral_speed
         # Desired yaw rate (rad/s) -> stick, via the full-stick rate.
         steering = YAW_STICK_SIGN * (self.yaw_gain * bearing) / self.max_yaw_rate_rad
-        altitude = self.height_gain * (gate["z"] - pos[2]) / self.altitude_trim_range
+        # Feed-forward to the gate's height about the frozen hold setpoint,
+        # plus a proportional term that only acts during the transient. See the
+        # module docstring: without the feed-forward the steady-state height
+        # error is (gate_z - setpoint)/(1 + height_gain), which is zero only on
+        # a flat course.
+        z_ref = self._height_ref(gate_idx, lx)
+        setpoint = self.altitude_setpoint_fn() if self.altitude_setpoint_fn else None
+        height_ff = 0.0 if setpoint is None else (z_ref - float(setpoint))
+        altitude = (
+            height_ff + self.height_gain * (z_ref - pos[2])
+        ) / self.altitude_trim_range
 
         return np.clip(
             np.array([steering, throttle, roll, altitude], dtype=np.float32), -1.0, 1.0

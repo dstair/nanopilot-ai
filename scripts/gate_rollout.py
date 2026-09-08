@@ -45,7 +45,8 @@ def main():
                         "policy; needs DRONE_VELOCITY_CONTROL")
     p.add_argument("--cruise-speed", type=float, default=1.5)
     p.add_argument("--lookahead", type=float, default=3.0)
-    p.add_argument("--height-gain", type=float, default=0.5)
+    p.add_argument("--height-gain", type=float, default=0.75)
+    p.add_argument("--height-lookahead", type=float, default=0.0)
     p.add_argument("--world", default="slalom_gates_80mm")
     p.add_argument("--airframe", default="80mm")
     p.add_argument("--episodes", type=int, default=5)
@@ -138,10 +139,14 @@ def main():
         norm = None
         expert = GateExpert.from_env(
             drone_env, gates,
-            cruise_speed=args.cruise_speed, lookahead=args.lookahead,
-                height_gain=args.height_gain,
+            cruise_speed=args.cruise_speed,
+            lookahead=args.lookahead,
+            height_gain=args.height_gain,
+            height_lookahead=args.height_lookahead,
         )
-        print(f"Expert: cruise={args.cruise_speed} lookahead={args.lookahead}")
+        print(f"Expert: cruise={args.cruise_speed} lookahead={args.lookahead} "
+              f"height_gain={args.height_gain} "
+              f"height_lookahead={args.height_lookahead}")
     else:
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -152,8 +157,16 @@ def main():
         model = PPO.load(model_path, device="cpu")
 
     HALF_W = gate_env.gate_half_width
-    Z_MIN, Z_MAX = gate_env.gate_z_min, gate_env.gate_z_max
-    print(f"\nPass window: |ly| <= {HALF_W}m, {Z_MIN} <= z <= {Z_MAX}\n")
+
+    def z_window(g):
+        """Per-gate height window, measured from the SDF by parse_world."""
+        return (g.get("z_min", gate_env.gate_z_min), g.get("z_max", gate_env.gate_z_max))
+
+    print(f"\nPass window: |ly| <= {HALF_W}m, height per gate:")
+    for g in gates:
+        zlo, zhi = z_window(g)
+        print(f"  {g['name']}: z={g['z']:.2f}  pass {zlo:.2f}-{zhi:.2f}")
+    print()
 
     crossings = []
     traces = []
@@ -206,18 +219,21 @@ def main():
             # detect the crossing ourselves for reporting
             if prev_lx is not None and prev_lx < 0.0 <= lx and idx == prev_idx:
                 speed = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
-                through = abs(ly) <= HALF_W and Z_MIN <= z <= Z_MAX
+                zlo, zhi = z_window(gate)
+                dz = z - gate["z"]
+                through = abs(ly) <= HALF_W and zlo <= z <= zhi
                 why = []
                 if abs(ly) > HALF_W:
                     why.append(f"lateral {ly:+.2f}m (limit {HALF_W})")
-                if not (Z_MIN <= z <= Z_MAX):
-                    why.append(f"height {z:.2f}m (band {Z_MIN}-{Z_MAX})")
+                if not (zlo <= z <= zhi):
+                    why.append(f"height {z:.2f}m (band {zlo:.2f}-{zhi:.2f})")
                 crossings.append(
-                    dict(ep=ep, gate=idx, ly=ly, z=z, speed=speed, through=through)
+                    dict(ep=ep, gate=idx, ly=ly, z=z, dz=dz, speed=speed,
+                         through=through, z_lo=zlo, z_hi=zhi)
                 )
                 verdict = "PASS" if through else "MISS: " + ", ".join(why)
                 print(f"  gate {idx} crossing: ly={ly:+.2f} z={z:.2f} "
-                      f"speed={speed:.2f}m/s  {verdict}")
+                      f"dz={dz:+.2f} speed={speed:.2f}m/s  {verdict}")
             prev_lx = gate_env._prev_gate_lx
             if gate_env._gate_idx != prev_idx:
                 prev_idx = gate_env._gate_idx
@@ -244,13 +260,18 @@ def main():
         lat = [abs(c["ly"]) for c in crossings]
         spd = [c["speed"] for c in crossings]
         zs = [c["z"] for c in crossings]
+        dzs = [abs(c["dz"]) for c in crossings]
         lat_miss = sum(1 for c in crossings if abs(c["ly"]) > HALF_W)
-        z_miss = sum(1 for c in crossings if not (Z_MIN <= c["z"] <= Z_MAX))
+        z_miss = sum(1 for c in crossings if not (c["z_lo"] <= c["z"] <= c["z_hi"]))
         print(f"crossings={n} passes={passes} ({passes/n*100:.0f}%)")
         print(f"|lateral offset|: mean={np.mean(lat):.2f}m median={np.median(lat):.2f}m "
               f"max={np.max(lat):.2f}m  (window {HALF_W}m)")
         print(f"height at crossing: mean={np.mean(zs):.2f}m min={np.min(zs):.2f} "
-              f"max={np.max(zs):.2f}  (band {Z_MIN}-{Z_MAX})")
+              f"max={np.max(zs):.2f}")
+        # The metric that reports height CONTROL, as opposed to whether the
+        # drone happened to be inside the window: error against the gate.
+        print(f"|height error| vs gate: mean={np.mean(dzs):.2f}m "
+              f"median={np.median(dzs):.2f}m max={np.max(dzs):.2f}m")
         print(f"approach speed: mean={np.mean(spd):.2f} max={np.max(spd):.2f} m/s")
         print(f"misses by lateral={lat_miss}, by height={z_miss}")
         near = sum(1 for c in crossings if HALF_W < abs(c["ly"]) <= 2 * HALF_W)

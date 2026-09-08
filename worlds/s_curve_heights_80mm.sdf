@@ -1,0 +1,232 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="s_curve_heights_80mm">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin name='gz::sim::systems::Physics' filename='gz-sim-physics-system'/>
+    <plugin name='gz::sim::systems::UserCommands' filename='gz-sim-user-commands-system'/>
+    <plugin name='gz::sim::systems::SceneBroadcaster' filename='gz-sim-scene-broadcaster-system'/>
+    <plugin name='gz::sim::systems::Sensors' filename='gz-sim-sensors-system'>
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin name='gz::sim::systems::Imu' filename='gz-sim-imu-system'/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision"><geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry></collision>
+        <visual name="visual"><geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry><material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- S-curve teaching course with VARIED GATE HEIGHTS.
+
+         The x/y/yaw of every gate is IDENTICAL to s_curve_gates_80mm.sdf,
+         which a distilled vision student already flies 10/10. Only z differs,
+         so a regression here is attributable to height and nothing else.
+
+         Heights (m): 1.50 2.16 2.21 1.57 1.20 1.97 2.29 1.80 1.23 1.43
+         Range 1.20-2.29. Gate 01 sits at start_alt so the course opens with no
+         height transient.
+
+         THE PROFILE IS A HELIX, NOT A SEQUENCE OF STEPS, and that is forced by
+         the plant. Measured with scripts/probe_alt_step.py on 2026-09-07, the
+         PD altitude hold is a second-order system with w_n = 0.46 rad/s and
+         zeta = 0.42: it takes ~5s to first REACH a moved target and ~20s to
+         settle. Gates are 3.76m apart, i.e. 2.5s at the expert's 1.5 m/s
+         cruise, so a height that steps gate to gate is a square wave five
+         times faster than the loop can follow. An earlier per-gate step
+         profile (max step 0.90m) was tried and the expert managed 49-62% of
+         crossings, missing every one of them on height, with the drone
+         swinging 0.2m to 3.9m; the response was 90-180 degrees out of phase,
+         not merely lagging.
+
+         So height here is z(s) = 1.75 + 0.55*sin(2*pi*s/18 + phi) along the
+         38m of track: a 18m wavelength, ~4.8 gates, 12s per cycle at cruise.
+         Peak climb rate is 0.29 m/s, which the loop tracks with a lag the
+         expert's height lookahead cancels. Both arcs carry a climb AND a
+         descent (gates 01-05 go up then down, 06-10 likewise), so the student
+         cannot learn "turning left means climb".
+
+         Height stays inside the trim authority: under DRONE_VELOCITY_CONTROL
+         the altitude axis is a LINEAR height trim of DRONE_ALTITUDE_TRIM_RANGE
+         metres about the hold setpoint, which every takeoff pins at
+         start_alt = 1.5, so the expert's label is (z_ref - 1.5) / TRIM_RANGE
+         and TRIM_RANGE = 1.0 makes 0.5-2.5m reachable.
+
+         GATES ARE CLOSED RECTANGLES here, unlike the goal-shaped 3m-tall gates
+         of the flat courses. A gate whose only horizontal member is a bar 1.5m
+         above its centre has no visible vertical centre, and height is the
+         whole point of this course. The opening is 1.9m wide x 1.9m tall
+         (posts at y = +-1.0, bars at z = +-1.0, all members 0.1m thick).
+
+         The opening is SIZED ON THE EXPERT'S MEASURED TRACKING ERROR, not
+         chosen for looks. The expert holds 0.32m mean / 0.66m max height error
+         at the crossing, so a +-0.6m window (the 1.4m-tall gate tried first)
+         put it right on the edge and its pass rate swung 88-100% run to run. A
+         +-0.8m window leaves margin without making the course trivial.
+
+         The pass window follows from that geometry: eval_flight.parse_world
+         derives the vertical window from the posts' own height, so it moves
+         with the gate instead of sitting at an absolute 0.2-3.0m. On the flat
+         courses the same rule gives 0.2-2.8m at a gate of z=1.5, i.e. what
+         those courses always used.
+
+         NOTE: names are ZERO-PADDED. eval_flight.parse_world sorts gates by
+         model name as a STRING, so gate_10 would sort before gate_2. -->
+    <model name="gate_01">
+      <static>true</static>
+      <pose>5.000 0.000 1.50 0 0 0.0000</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_02">
+      <static>true</static>
+      <pose>8.535 1.287 2.16 0 0 0.6981</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_03">
+      <static>true</static>
+      <pose>10.416 4.545 2.21 0 0 1.3963</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_04">
+      <static>true</static>
+      <pose>9.763 8.250 1.57 0 0 2.0944</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_05">
+      <static>true</static>
+      <pose>6.881 10.668 1.20 0 0 2.7925</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_06">
+      <static>true</static>
+      <pose>1.713 12.549 1.97 0 0 2.7925</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_07">
+      <static>true</static>
+      <pose>-1.169 14.968 2.29 0 0 2.0944</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_08">
+      <static>true</static>
+      <pose>-1.823 18.673 1.80 0 0 1.3963</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>0 1 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_09">
+      <static>true</static>
+      <pose>0.059 21.931 1.23 0 0 0.6981</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 0 1 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <model name="gate_10">
+      <static>true</static>
+      <pose>3.594 23.218 1.43 0 0 0.0000</pose>
+      <link name="link">
+        <visual name="v1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <visual name="v4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry><material><ambient>1 1 0 1</ambient></material></visual>
+        <collision name="c1"><pose>0 -1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c2"><pose>0 1.0 0 0 0 0</pose><geometry><box><size>0.1 0.1 2.0</size></box></geometry></collision>
+        <collision name="c3"><pose>0 0 1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+        <collision name="c4"><pose>0 0 -1.0 0 0 0</pose><geometry><box><size>0.1 2 0.1</size></box></geometry></collision>
+      </link>
+    </model>
+    <include>
+      <uri>model://betaloop_drone_cam_80mm</uri>
+    </include>
+  </world>
+</sdf>

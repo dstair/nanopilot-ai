@@ -102,6 +102,11 @@ bash ./scripts/stop_all.sh
 # Altitude hold check: healthy = roughly constant z for 30s at neutral
 uv run --env-file .env python scripts/probe_hover.py
 
+# Altitude step response: how fast the hold tracks a MOVING target. probe_hover
+# only ever tests a FIXED one, which says nothing about a varied-height course.
+GZ_WORLD=s_curve_heights_80mm uv run --env-file .env python \
+  scripts/probe_alt_step.py --amplitude=0.5
+
 # Why is the policy missing gates? Per-crossing lateral/height/speed vs the
 # pass window (needs a running stack)
 uv run --env-file .env python scripts/gate_rollout.py \
@@ -159,7 +164,7 @@ uv run --env-file .env python -m py_compile \
   nanopilot/rl_env.py nanopilot/rl_train.py nanopilot/rl_collect.py \
   nanopilot/gate_expert.py \
   scripts/gate_rollout.py scripts/ff_sweep.py scripts/detach_launch.py \
-  scripts/probe_velocity.py
+  scripts/probe_velocity.py scripts/probe_alt_step.py
 
 uv run --env-file .env python nanopilot/torch_train.py --help
 uv run --env-file .env python nanopilot/evaluate.py --help
@@ -248,6 +253,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `nanopilot/rl_collect.py` | flies a trained RL teacher, records tubs for BC distillation |
 | `nanopilot/gz_reset_worker.py` | persistent subprocess issuing gz set_pose teleports |
 | `scripts/probe_hover.py` | takeoff + 30s neutral hold; altitude-hold check |
+| `scripts/probe_alt_step.py` | altitude step response: overshoot, implied w_n/zeta |
 | `scripts/probe_velocity.py` | velocity-cascade step response: signs, gains, cross-axis leakage |
 | `scripts/gate_rollout.py` | flies a trained RL policy; per-gate-crossing lateral/height/speed vs the pass window |
 | `scripts/ff_sweep.py` | sweeps `DRONE_PITCH_THROTTLE_FEEDFORWARD` airborne, climb rate per pitch |
@@ -257,6 +263,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `scripts/test_thrust.sh` | launches stack, runs `test_thrust.py`, tears down |
 | `scripts/eval_flight.sh` | launches stack, runs `eval_flight.py`, tears down |
 | `scripts/rl_train.sh` | supervisor: launches stack, runs `rl_train.py`, rebuilds+resumes on failure |
+| `worlds/s_curve_heights_80mm.sdf` | 10-gate varied-height S-curve; per-gate pass window |
 | `worlds/*_80mm.sdf` | 80mm worlds |
 | `worlds/drone_course_65mm.sdf` | retained 65mm Air65 world |
 
@@ -3967,3 +3974,190 @@ compare it to a pure-expert run's loss.
 3. DAgger round 2 is available but has nothing to fix on this course.
 4. Still open from earlier: 65mm has not been re-tested airborne on the tamed
    pitch/roll PID gains and the corrected yaw scaling.
+
+## Current Handoff (2026-09-08, varied gate heights: course built and SOLVED)
+
+**STATE: stopped, nothing running.** `models/bc_dagger1_heights.pth` flies the
+new varied-height course `s_curve_heights_80mm` **10/10 gates, 5/5 episodes**,
+at expert pace, zero crashes. The altitude axis is now genuinely exercised:
+expert labels have std **0.331** against 0.077 on the flat course.
+
+### Result
+
+`eval_flight.py --runs=5 --duration=60 --rate-hz=20`, all five episodes
+`completed` in 27.1-28.1s (the scripted expert flies it in ~27.8s):
+
+| student | course | gates | crossing height err |
+| --- | --- | --- | --- |
+| `bc_expert_scurve_v1` | flat S-curve | 3.4 / 10 | n/a (flat) |
+| `bc_dagger1_scurve` | flat S-curve | 10.0 / 10 | n/a (flat) |
+| `bc_expert_heights_v1` | **heights** | 5.6 / 10 | 0.271m |
+| **`bc_dagger1_heights`** | **heights** | **10.0 / 10** | **0.254m (max 0.465)** |
+
+The DAgger student tracks height BETTER than the expert it was distilled from
+(0.254m vs 0.34m mean crossing error), which is the usual smoothing effect and
+not a bug.
+
+The expert-only student reproduced the pattern of 2026-09-07 exactly: it flew
+well on-manifold (one episode 10/10 in 42.9s) and lost the others to the known
+off-manifold traps -- one episode FROZE at (-5.71, 12.24) and held position to
+within 2cm from t=28s to t=60s, one crashed. One DAgger round fixed it, again.
+
+### The course: worlds/s_curve_heights_80mm.sdf
+
+x/y/yaw are IDENTICAL to `s_curve_gates_80mm`, so a regression is attributable
+to height and nothing else. Heights are 1.50 2.16 2.21 1.57 1.20 1.97 2.29 1.80
+1.23 1.43 (range 1.20-2.29). Gate 01 sits at `start_alt` so there is no opening
+transient.
+
+**The profile is a HELIX, not per-gate steps, and that is forced by the plant.**
+`scripts/probe_alt_step.py` (new) measures the PD altitude hold as a
+second-order system with **w_n = 0.46 rad/s, zeta = 0.42** -- ~5s to first reach
+a moved target, ~20s to settle. Gates are 3.76m apart, i.e. 2.5s at cruise, so a
+per-gate step profile is a square wave five times faster than the loop can
+follow. That was tried first (max step 0.90m) and the EXPERT managed only
+49-62% of crossings, missing every one on height, with z swinging 0.2m to 3.9m.
+Height is now `z(s) = 1.75 + 0.55*sin(2*pi*s/18 + phi)` along the 35.6m of
+track: 18m wavelength, peak climb rate 0.29 m/s. Both arcs carry a climb AND a
+descent, so the student cannot learn "turning left means climb".
+
+**Gates are closed rectangles here** (1.9m wide x 1.9m tall; posts at y=+-1.0,
+bars at z=+-1.0), unlike the goal-shaped 3m-tall gates of the flat courses. A
+gate whose only horizontal member is a bar 1.5m above its centre has no visible
+vertical centre, and height is the whole point of this course.
+
+The opening was SIZED ON THE EXPERT'S MEASURED ERROR, not chosen for looks. At
+a 1.4m-tall gate (window +-0.6m) the expert sat right on the edge and its pass
+rate swung 88-100% run to run; +-0.8m leaves margin.
+
+### The pass window is now PER GATE, derived from the SDF
+
+An absolute 0.2-3.0m band would score a pass through a gate at z=2.29 for a
+drone cruising at 1.5m, i.e. it would not measure height at all.
+`eval_flight.parse_world` now measures each gate's tallest box (the posts) and
+returns `z_min`/`z_max` = `gate_z +- (post_height/2 - 0.2)`; `GateTracker` and
+`GateChaseEnv` both consume it and fall back to the old absolute band for a gate
+with no measurable geometry. On the flat courses this yields **0.2-2.8m at a
+gate of z=1.5**, which is what they always used, and gate ORDER is unchanged.
+
+`GateTracker` also records EVERY crossing now (`gate_crossings` in the JSON,
+`mean_crossing_height_err_m` in the aggregate). Read that, not gate count, to
+judge height control: the count only says whether the drone was inside the
+window. Crossings wider than `2 * half_width` laterally are discarded -- a
+gate's local x=0 plane is infinite, so the drone crosses it whenever it moves
+past that line anywhere in the world, and those samples would poison the
+statistics. Pass counting was never affected by them.
+
+### GateExpert: the height law changed, and it had to
+
+Old law: `altitude = Kz * (gate_z - z) / TRIM_RANGE`. Under
+`DRONE_VELOCITY_CONTROL` the env holds height at
+`setpoint + altitude * TRIM_RANGE`, so a pure proportional command settles at
+`(setpoint + Kz*gate_z)/(1 + Kz)` -- with Kz=0.5 that leaves **67% of
+(gate_z - setpoint) as PERMANENT error**. On a flat course the setpoint IS the
+gate height and the error is identically zero, which is why this never showed.
+On a varied-height course it is fatal: a gate 0.9m above the setpoint would be
+approached to within 0.6m and never reached.
+
+The law is now a FEED-FORWARD plus a proportional term:
+
+    z_ref     = the course height at the drone's own along-track position
+                (piecewise-linear between gates; GateExpert._height_ref)
+    altitude  = ((z_ref - setpoint) + Kz * (z_ref - z)) / TRIM_RANGE
+
+The feed-forward asks for exactly the height wanted, with no steady-state error.
+The setpoint is frozen at `start_alt` by every takeoff path, so it is a constant
+per episode and the label stays a pure function of the gate -- which is what
+keeps it learnable by a memoryless student. **Verified numerically identical to
+the old law on a flat course** (max difference 0.00e+00 over the whole
+s_curve_gates layout), so nothing about the solved flat course changed.
+
+`height_lookahead` shifts `z_ref` forward to cancel loop lag and **defaults to
+0**. Keep it small: in flight the hold tracks a 0.29 m/s ramp with almost no
+lag, so a 3m lead put the drone 0.4-0.6m PAST every gate's height at the
+crossing -- the lead error simply replaced the lag error.
+
+`height_gain` default is now **0.75**, chosen by sweep on this course:
+
+| Kz | crossings passed | error tail |
+| --- | --- | --- |
+| 0.5 | 97% | max 0.64m |
+| **0.75** | **98% (49/50, 4 of 5 episodes 10/10)** | **max 0.83m** |
+| 1.0 | 96% | max 1.19m |
+| 1.5 | 79%, **crashed 2 of 3 episodes** | max 1.10m |
+
+### Artifacts
+
+| path | what |
+| --- | --- |
+| `worlds/s_curve_heights_80mm.sdf` | 10-gate varied-height S-curve |
+| `data/tub_24_26-09-07` | 22,230 rows, expert rollouts, **40/40 kept, all 10/10**, 274MB |
+| `data/tub_25_26-09-08` | 18,563 rows, DAgger round 1, 30/30 kept |
+| `models/bc_expert_heights_v1.pth` | expert-only student, best val 0.000079, 5.6/10 gates |
+| **`models/bc_dagger1_heights.pth`** | **DAgger student, 10/10 gates -- CURRENT BEST on this course** |
+| `scripts/probe_alt_step.py` | altitude step response: overshoot, implied w_n/zeta |
+
+Offline fidelity of `bc_expert_heights_v1` on tub_24 (in-sample):
+yaw 0.9998, pitch 0.9965, roll 0.9998, **altitude 0.9991** (against 0.9239 on
+the flat course, where the axis carried almost no signal).
+
+DAgger coverage, which is what the round bought:
+
+| | tub_24 (expert) | tub_25 (DAgger) |
+| --- | --- | --- |
+| throttle range | +0.57 .. +0.75 | **-0.75 .. +0.75** (reverse) |
+| throttle std | 0.029 | **0.332** |
+| teacher says "stop" (thr < 0.15) | **0.0%** | **8.8%** |
+| yaw \|x\|>0.5 | 0.0% | **13.8%** |
+
+As on 2026-09-07b, DAgger val loss is meaningless here: best val was 0.0277
+against 0.000079 for the expert-only run, a ~350x gap, and the DAgger model
+flies 10/10 while the other manages 5.6. The split is chronological, so val is
+the tail of the DAgger tub -- off-manifold states induced by the OLD student,
+which the retrained one never visits. **Judge DAgger rounds by eval_flight only.**
+
+### The binding constraint is now the altitude BANDWIDTH, not the student
+
+Worth knowing before designing a harder height course. With this plant you
+cannot have both an expert that tracks reliably and a height spread much larger
+than twice the pass window, because the hold's rise time (~5s) is twice the
+gate-to-gate interval (2.5s). The levers, in order:
+
+1. **Raise `DRONE_ALTITUDE_HOLD_KP` and `DRONE_ALTITUDE_HOLD_K` together.**
+   w_n = sqrt(s * Kp) with a measured thrust slope s ~ 0.007 m/s^2 per PWM, so
+   Kp=30 gives the 0.46 rad/s measured. Doubling both raises bandwidth 1.41x at
+   constant damping. Watch the +-200 PWM clip on `alt_hold_bias`: at high K the
+   velocity term alone saturates around 0.6 m/s of climb, and a saturated
+   proportional loop is a relay.
+2. Shorter gate spacing or a slower cruise, which buys the same thing by giving
+   the loop more time per transition.
+3. Do NOT just shrink the pass window. That was tried (+-0.6m) and it only made
+   the EXPERT unreliable.
+
+`DRONE_ALTITUDE_TRIM_RANGE = 1.0` is still un-swept, but it is no longer
+un-exercised: with `start_alt = 1.5` it caps reachable heights at 0.5-2.5m, and
+the course's 1.20-2.29 uses 79% of that authority.
+
+### Do this next
+
+1. The heights course is solved and can no longer discriminate. If a harder
+   benchmark is wanted, raise the altitude-loop bandwidth first (above) and only
+   then increase the height amplitude or shorten the wavelength -- the plant,
+   not the student, is what limits the profile today.
+2. Re-validate `bc_dagger1_scurve` on the flat course if you want belt and
+   braces. It was NOT re-run this session; the reasoning that nothing changed
+   for it is that the expert's law is bit-identical at constant gate height and
+   the scoring window moved only from 0.2-3.0 to 0.2-2.8, against a student that
+   flies at 1.54-1.56m.
+3. Still open from earlier: 65mm has not been re-tested airborne on the tamed
+   pitch/roll PID gains or the corrected yaw scaling.
+
+### Infra notes
+
+- The MSP health gate earned its keep twice and cost time once: a DAgger run was
+  launched while the gate had just printed `(None, [], None, [])` and every
+  episode died with `BetaFlight lost arming`. READ the gate's output before
+  launching, not just run it.
+- `eval_flight.py` writes its JSON with `--json-output`, not `--output`.
+- `stop_all.sh` chained after other commands in one shell has killed the calling
+  shell mid-sequence here. Run it on its own line.

@@ -55,11 +55,53 @@ def world_sdf_path(world):
     return os.path.join(os.path.dirname(__file__), "..", "worlds", f"{world}.sdf")
 
 
+# Margin between a gate's physical vertical clearance and the height window a
+# pass is scored in, in metres. Small enough that the window still means "went
+# through the hoop", large enough that a crossing interpolated between two 50ms
+# samples is not scored a pass on a grazing clip of the frame.
+GATE_Z_MARGIN = 0.2
+
+# Fallback height window for a gate whose SDF has no box geometry to measure,
+# in absolute metres. This is what every course used before the window was made
+# gate-relative, and it is only reached if the model cannot be measured at all.
+GATE_Z_ABS = (0.2, 3.0)
+
+
+def gate_z_window(model, gate_z):
+    """Vertical pass window for one gate model, in absolute metres.
+
+    Derived from the gate's own geometry rather than hardcoded, because a
+    course with VARIED GATE HEIGHTS needs a window that moves with the gate:
+    an absolute 0.2-3.0m band would score a pass through a gate at z=2.35 for a
+    drone cruising at 1.5m, i.e. it would not measure height at all.
+
+    The measurement is the tallest box in the model -- the posts -- which spans
+    the full opening by construction. On the flat courses the posts are 3m, so
+    this yields 0.2-2.8m at a gate of z=1.5, which is the band those courses
+    were always scored in.
+    """
+    tallest = 0.0
+    for size_el in model.iter("size"):
+        try:
+            dims = [float(v) for v in (size_el.text or "").split()]
+        except ValueError:
+            continue
+        if len(dims) == 3:
+            tallest = max(tallest, dims[2])
+    if tallest <= 0.0:
+        return GATE_Z_ABS
+    half = tallest / 2.0 - GATE_Z_MARGIN
+    if half <= 0.0:
+        return GATE_Z_ABS
+    return (gate_z - half, gate_z + half)
+
+
 def parse_world(world):
     """Extract gate poses and landing-pad position from the world SDF.
 
-    Returns (gates, pad_xy) where gates is a list of dicts with x/y/z/yaw
-    sorted by model name, and pad_xy is (x, y) or None.
+    Returns (gates, pad_xy) where gates is a list of dicts with x/y/z/yaw plus
+    the per-gate vertical pass window z_min/z_max, sorted by model name, and
+    pad_xy is (x, y) or None.
     """
     path = world_sdf_path(world)
     gates = []
@@ -77,7 +119,9 @@ def parse_world(world):
             continue
         x, y, z, _r, _p, yaw = vals
         if name.startswith("gate"):
-            gates.append({"name": name, "x": x, "y": y, "z": z, "yaw": yaw})
+            z_min, z_max = gate_z_window(model, z)
+            gates.append({"name": name, "x": x, "y": y, "z": z, "yaw": yaw,
+                          "z_min": z_min, "z_max": z_max})
         elif name == "landing_pad":
             pad_xy = (x, y)
     gates.sort(key=lambda g: g["name"])
@@ -100,15 +144,29 @@ class GateTracker:
     """Counts gate passes from consecutive positions.
 
     A pass is a crossing of the gate's local x=0 plane while inside the
-    opening (posts at local y = +/-1m, 3m tall). Each gate counts once.
+    opening: |lateral| <= half_width, and height inside the gate's own
+    z_min/z_max as measured from the SDF by parse_world. Each gate counts once.
+
+    The height window is PER GATE, not absolute. On a course with varied gate
+    heights an absolute band would score a pass through a gate at z=2.35 for a
+    drone cruising at 1.5m, so gate count would say nothing about height.
+
+    Every crossing is also recorded in `crossings`, pass or miss, with its
+    lateral offset and its height error against the gate. That is the metric
+    that discriminates height control: gate COUNT only reports whether the
+    drone was inside the window, while the error says how well it tracked.
     """
 
-    def __init__(self, gates, half_width=0.9, z_min=0.2, z_max=3.0):
+    def __init__(self, gates, half_width=0.9, z_min=0.2, z_max=3.0, near_width=None):
         self.gates = gates
         self.half_width = half_width
+        # Lateral distance out to which a plane crossing still counts as an
+        # attempt at this gate, for the crossing record only.
+        self.near_width = 2.0 * half_width if near_width is None else near_width
         self.z_min = z_min
         self.z_max = z_max
         self.passed = {}  # name -> episode time of pass
+        self.crossings = []  # dicts: name, t, ly, z, dz, passed
         self._prev_local = [None] * len(gates)
 
     def update(self, t, pos):
@@ -128,7 +186,28 @@ class GateTracker:
             f = plx / (plx - lx)
             ly_c = ply + f * (ly - ply)
             z_c = pz + f * (pos[2] - pz)
-            if abs(ly_c) <= self.half_width and self.z_min <= z_c <= self.z_max:
+            z_min = g.get("z_min", self.z_min)
+            z_max = g.get("z_max", self.z_max)
+            ok = abs(ly_c) <= self.half_width and z_min <= z_c <= z_max
+            # A gate's local x=0 plane is infinite, so the drone crosses it
+            # whenever it happens to move past that line ANYWHERE in the world.
+            # Only a crossing near the opening is an attempt at this gate;
+            # wider ones would poison the height-error statistics with samples
+            # taken 10m off to the side. Pass counting is unaffected either way,
+            # since `ok` already requires being inside the opening.
+            if abs(ly_c) > self.near_width:
+                continue
+            self.crossings.append(
+                {
+                    "gate": g["name"],
+                    "t": round(t, 2),
+                    "lateral_m": round(float(ly_c), 3),
+                    "z_m": round(float(z_c), 3),
+                    "height_err_m": round(float(z_c - g["z"]), 3),
+                    "passed": bool(ok),
+                }
+            )
+            if ok:
                 self.passed[g["name"]] = round(t, 2)
 
 
@@ -382,6 +461,13 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
         episode["gates_passed"] = len(tracker.passed)
         episode["gates_total"] = len(gates)
         episode["gate_pass_times_s"] = tracker.passed
+        episode["gate_crossings"] = tracker.crossings
+        if tracker.crossings:
+            herr = np.array([abs(c["height_err_m"]) for c in tracker.crossings])
+            lat = np.array([abs(c["lateral_m"]) for c in tracker.crossings])
+            episode["crossing_height_err_mean_m"] = round(float(herr.mean()), 3)
+            episode["crossing_height_err_max_m"] = round(float(herr.max()), 3)
+            episode["crossing_lateral_mean_m"] = round(float(lat.mean()), 3)
     # Zero controls immediately so a crashed/finished pilot stops commanding.
     env.run_threaded(0.0, 0.0, 0.0, 0.0)
     return episode
@@ -404,6 +490,14 @@ def aggregate(episodes, task):
         agg["mean_gates_passed"] = round(
             sum(e.get("gates_passed", 0) for e in episodes) / n, 2
         )
+        # Height error at the crossing plane, over every crossing in every
+        # episode. On a varied-height course this is the metric that reports
+        # altitude tracking; gate count only says whether the drone was inside
+        # the window at all.
+        errs = [abs(c["height_err_m"]) for e in episodes for c in e.get("gate_crossings", [])]
+        if errs:
+            agg["mean_crossing_height_err_m"] = round(sum(errs) / len(errs), 3)
+            agg["max_crossing_height_err_m"] = round(max(errs), 3)
     if task == "line":
         agg["mean_along_track_m"] = round(
             sum(e.get("along_track_max_m", 0.0) for e in episodes) / n, 3
@@ -423,6 +517,11 @@ def evaluate(cfg, args):
     gates, pad_xy = parse_world(world)
     task = args.task if args.task != "auto" else detect_task(world, gates, pad_xy)
     print(f"World: {world}  task: {task}  gates: {len(gates)}  pad: {pad_xy}")
+    for g in gates:
+        print(
+            f"  {g['name']}: ({g['x']:.2f}, {g['y']:.2f}, {g['z']:.2f}) "
+            f"yaw {math.degrees(g['yaw']):+.1f}  pass z {g['z_min']:.2f}-{g['z_max']:.2f}"
+        )
 
     _wait_for_tcp(
         getattr(cfg, "BETAFLIGHT_RC_HOST", "127.0.0.1"),
@@ -499,6 +598,11 @@ def evaluate(cfg, args):
             summary = f"{episode['result']} after {episode['survival_s']}s"
             if task == "gates":
                 summary += f", gates {episode.get('gates_passed', 0)}/{len(gates)}"
+                if "crossing_height_err_mean_m" in episode:
+                    summary += (
+                        f", height err {episode['crossing_height_err_mean_m']}m "
+                        f"(max {episode['crossing_height_err_max_m']})"
+                    )
             if task == "line":
                 summary += (
                     f", along-track {episode.get('along_track_max_m', 0.0)}m,"

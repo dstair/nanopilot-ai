@@ -44,7 +44,8 @@ def main():
                              "policy; needs DRONE_VELOCITY_CONTROL")
     parser.add_argument("--cruise-speed", type=float, default=1.5)
     parser.add_argument("--lookahead", type=float, default=3.0)
-    parser.add_argument("--height-gain", type=float, default=0.5)
+    parser.add_argument("--height-gain", type=float, default=0.75)
+    parser.add_argument("--height-lookahead", type=float, default=0.0)
     parser.add_argument("--world", default=os.environ.get("GZ_WORLD", "slalom_gates_80mm"))
     parser.add_argument("--airframe", choices=["65mm", "80mm"], default="80mm")
     parser.add_argument("--myconfig", default=None)
@@ -146,6 +147,7 @@ def main():
                 drone_env, gates,
                 cruise_speed=args.cruise_speed, lookahead=args.lookahead,
                 height_gain=args.height_gain,
+                height_lookahead=args.height_lookahead,
             )
             norm = model = None
             print(f"Expert: cruise={args.cruise_speed} lookahead={args.lookahead}")
