@@ -7,6 +7,17 @@ one or more episodes, and scores each episode from Gazebo ground-truth pose:
 survival time, along-track progress, cross-track error, gates passed.
 Writes machine-readable JSON so runs/models can be compared over time.
 
+Tasks, inferred from the world SDF unless --task says otherwise:
+
+    gates    fly every gate in order; success = all of them
+    land     fly to the pad and touch down on it; success = gentle, stopped,
+             on the pad. Ground contact is scored by --touchdown-z /
+             --settle-vz / --settle-speed, NOT by --crash-z, because a
+             textbook landing passes crash_z on the way down
+    line     fly to the pad and stop there; success = horizontal proximity
+             while still airborne. Kept as an ablation of the land task
+    generic  survival and displacement only
+
 Requires BetaFlight SITL + Gazebo to already be running, for example via:
     GZ_HEADLESS=1 GZ_WORLD=slalom_gates_80mm ./scripts/start.sh --no-manage --airframe=80mm
 
@@ -45,6 +56,14 @@ POS = slice(7, 10)
 ATT = slice(10, 13)
 VEL = slice(13, 16)
 IMU = slice(16, 22)
+
+# Seconds of descent history the touchdown test looks back over to decide how
+# hard the drone arrived. The sample AT contact is already decelerating -- the
+# pose-derived velocity is low-passed with tau=0.1 and the ground stops the
+# drone in one frame -- so classifying on that sample alone scores every impact
+# as gentle. The fastest descent in the window before contact is the honest
+# number, and it is what probe_descent.py's landing legs report.
+TOUCHDOWN_VZ_WINDOW_S = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +148,18 @@ def parse_world(world):
 
 
 def detect_task(world, gates, pad_xy):
+    """Pick the scorer from what the world contains.
+
+    A pad and no gates now means "land", not "line". The two differ in what
+    counts as finishing: "line" completes on HORIZONTAL proximity to the pad
+    while still airborne, which is the right test for a fly-the-line ablation
+    and the wrong one for a task whose last five metres are vertical. "line"
+    stays reachable with --task=line for exactly that ablation.
+    """
     if gates:
         return "gates"
     if pad_xy is not None:
-        return "line"
+        return "land"
     return "generic"
 
 
@@ -245,6 +272,49 @@ def episode_metrics(track, start_xy, pad_xy):
     return metrics
 
 
+def classify_touchdown(recent, pos, pad_xy, pad_radius, settle_vz, settle_speed):
+    """Decide what a ground contact WAS, from the approach that preceded it.
+
+    `recent` is the tail of the track covering TOUCHDOWN_VZ_WINDOW_S before
+    contact, as (t, x, y, z, vz, speed_xy) tuples. Returns (result, info).
+
+    Three ways to reach the ground that are not a landing, each needing a
+    different fix, so each gets its own result rather than being folded into
+    "crashed":
+
+      crashed        arrived faster than settle_vz vertically -- a fall
+      skidded        gentle vertically but still travelling horizontally,
+                     i.e. a belly-flop at cruise speed. Without this test the
+                     scorer would call a drone that flew into the ground at
+                     1.5 m/s a successful landing, because its VERTICAL speed
+                     at contact can be tiny.
+      landed_off_pad a real landing, in the wrong place
+
+    Only the fourth case -- gentle, stopped, on the pad -- is "completed", so
+    success_rate keeps meaning the same thing it does for the gates task.
+    """
+    impact_vz = min(p[4] for p in recent)
+    impact_speed = max(p[5] for p in recent)
+    pad_offset = (
+        math.hypot(pos[0] - pad_xy[0], pos[1] - pad_xy[1])
+        if pad_xy is not None else float("nan")
+    )
+    info = {
+        "touchdown_vz_ms": round(float(impact_vz), 3),
+        "touchdown_speed_ms": round(float(impact_speed), 3),
+        "touchdown_pad_offset_m": round(float(pad_offset), 3),
+    }
+    if abs(impact_vz) >= settle_vz:
+        result = "crashed"
+    elif impact_speed >= settle_speed:
+        result = "skidded"
+    elif pad_xy is None or pad_offset > pad_radius:
+        result = "landed_off_pad"
+    else:
+        result = "completed"
+    return result, info
+
+
 # ---------------------------------------------------------------------------
 # Episode control
 
@@ -333,6 +403,7 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
 
     outputs = env.run_threaded(0.0, 0.0, 0.0, 0.0)
     start_xy = (outputs[POS][0], outputs[POS][1])
+    touchdown = None
 
     start = time.time()
     next_tick = start
@@ -350,7 +421,8 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
         att = outputs[ATT]
         vel = outputs[VEL]
         imu = outputs[IMU]
-        track.append((round(t, 3), pos[0], pos[1], pos[2], vel[2]))
+        track.append((round(t, 3), pos[0], pos[1], pos[2], vel[2],
+                      math.hypot(vel[0], vel[1])))
         if tracker is not None:
             tracker.update(t, pos)
 
@@ -364,7 +436,21 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
         if tracker is not None and len(tracker.passed) == len(gates):
             result = "completed"
             break
-        if pos[2] < args.crash_z:
+        if task == "land" and pos[2] < args.touchdown_z:
+            # Ground contact on the landing task. Which OUTCOME it is depends on
+            # how the drone arrived, so this must run instead of the crash_z
+            # test rather than after it: crash_z defaults to 0.12 and a textbook
+            # landing passes 0.12 on its way down (measured 2026-09-09: z<0.20
+            # at 5.4s, touchdown at 8.6s), so the old scorer called every
+            # successful landing a crash.
+            recent = [p for p in track if p[0] >= t - TOUCHDOWN_VZ_WINDOW_S]
+            result, touchdown = classify_touchdown(
+                recent, pos, pad_xy, args.pad_radius,
+                args.settle_vz, args.settle_speed,
+            )
+            touchdown["touchdown_s"] = round(t, 2)
+            break
+        if task != "land" and pos[2] < args.crash_z:
             result = "crashed"
             break
         if abs(att[0]) > args.crash_tilt_deg or abs(att[1]) > args.crash_tilt_deg:
@@ -457,6 +543,8 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
             episode["alt_cmd_absdiff_mean"] = round(float(np.abs(np.diff(arr)).mean()), 4)
     if track:
         episode.update(episode_metrics(track, start_xy, pad_xy))
+    if touchdown is not None:
+        episode.update(touchdown)
     if tracker is not None:
         episode["gates_passed"] = len(tracker.passed)
         episode["gates_total"] = len(gates)
@@ -498,13 +586,34 @@ def aggregate(episodes, task):
         if errs:
             agg["mean_crossing_height_err_m"] = round(sum(errs) / len(errs), 3)
             agg["max_crossing_height_err_m"] = round(max(errs), 3)
-    if task == "line":
+    if task in ("line", "land"):
         agg["mean_along_track_m"] = round(
             sum(e.get("along_track_max_m", 0.0) for e in episodes) / n, 3
         )
         agg["mean_cross_track_m"] = round(
             sum(e.get("cross_track_mean_m", 0.0) for e in episodes) / n, 3
         )
+    if task == "land":
+        # success_rate above already counts only clean landings. These split
+        # the failures, which is the point of the task: "did not land on the
+        # pad" and "fell out of the sky" need different fixes.
+        for label in ("landed_off_pad", "skidded"):
+            agg[f"{label}_rate"] = round(
+                sum(1 for e in episodes if e["result"] == label) / n, 3
+            )
+        touched = [e for e in episodes if "touchdown_s" in e]
+        agg["touchdown_rate"] = round(len(touched) / n, 3)
+        if touched:
+            for key, digits in (("touchdown_vz_ms", 3),
+                                ("touchdown_speed_ms", 3),
+                                ("touchdown_pad_offset_m", 3),
+                                ("touchdown_s", 2)):
+                agg[f"mean_{key}"] = round(
+                    sum(e[key] for e in touched) / len(touched), digits
+                )
+            agg["max_touchdown_vz_abs_ms"] = round(
+                max(abs(e["touchdown_vz_ms"]) for e in touched), 3
+            )
     if task == "generic":
         agg["mean_max_displacement_m"] = round(
             sum(e.get("max_displacement_m", 0.0) for e in episodes) / n, 3
@@ -603,11 +712,24 @@ def evaluate(cfg, args):
                         f", height err {episode['crossing_height_err_mean_m']}m "
                         f"(max {episode['crossing_height_err_max_m']})"
                     )
-            if task == "line":
+            if task in ("line", "land"):
                 summary += (
                     f", along-track {episode.get('along_track_max_m', 0.0)}m,"
                     f" cross-track mean {episode.get('cross_track_mean_m', 0.0)}m"
                 )
+            if task == "land":
+                if "touchdown_s" in episode:
+                    summary += (
+                        f", touchdown vz {episode['touchdown_vz_ms']} m/s"
+                        f" speed {episode['touchdown_speed_ms']} m/s"
+                        f" {episode['touchdown_pad_offset_m']}m from pad"
+                    )
+                else:
+                    summary += (
+                        ", NEVER TOUCHED DOWN"
+                        f" (final {episode.get('final_dist_to_pad_m', '?')}m"
+                        f" from pad, z {episode.get('alt_min_m', '?')}m)"
+                    )
             print(f"Episode {i + 1}: {summary}")
     finally:
         env.run_threaded(0.0, 0.0, 0.0, 0.0, direct_thrust=-1.0)
@@ -656,7 +778,7 @@ def main():
     parser.add_argument("--myconfig", default=None)
     parser.add_argument(
         "--task",
-        choices=["auto", "line", "gates", "generic"],
+        choices=["auto", "line", "land", "gates", "generic"],
         default="auto",
         help="auto = infer from world SDF (gates present / landing_pad present)",
     )
@@ -689,11 +811,32 @@ def main():
     parser.add_argument("--zero-altitude", action="store_true",
                         help="command altitude 0.0 instead of the model's 4th output "
                              "(diagnostic: leaves height to the vertical damper)")
-    parser.add_argument("--crash-z", type=float, default=0.12, help="crash below this altitude (m)")
+    parser.add_argument("--crash-z", type=float, default=0.12,
+                        help="crash below this altitude (m). NOT used by the "
+                             "land task, where ground contact is scored by "
+                             "--touchdown-z / --settle-vz instead")
+    parser.add_argument("--touchdown-z", type=float, default=0.06,
+                        help="land task: ground contact below this altitude (m)")
+    parser.add_argument("--settle-vz", type=float, default=0.15, metavar="MS",
+                        help="land task: arriving faster than this vertically "
+                             "is a crash, not a landing (m/s). Measured "
+                             "2026-09-09: a full-down command from a 1.5m "
+                             "cruise touches at 0.02 m/s at TRIM_RANGE=1.6 and "
+                             "0.18 at 2.0, so this sits between them")
+    parser.add_argument("--settle-speed", type=float, default=0.5, metavar="MS",
+                        help="land task: still travelling faster than this "
+                             "horizontally at contact is a skid, not a landing "
+                             "(m/s). Deliberately generous -- a third of the "
+                             "2.0 m/s cruise -- because its job is to refuse to "
+                             "score a belly-flop as a success, not to grade "
+                             "landing style")
     parser.add_argument("--crash-tilt-deg", type=float, default=70.0)
     parser.add_argument("--flyaway-z", type=float, default=12.0)
     parser.add_argument("--flyaway-xy", type=float, default=60.0)
-    parser.add_argument("--pad-radius", type=float, default=1.0, help="line task: success within this distance of the pad (m)")
+    parser.add_argument("--pad-radius", type=float, default=1.0,
+                        help="line task: success within this distance of the "
+                             "pad (m). land task: touching down further out "
+                             "than this is landed_off_pad, not a success")
     parser.add_argument("--json-output", default=None, help="metrics JSON path (default logs/eval_flight_<ts>.json)")
     args = parser.parse_args()
 

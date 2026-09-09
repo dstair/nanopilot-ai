@@ -2342,6 +2342,87 @@ still non-negotiable: the trim range rescales what the altitude axis MEANS on
 every course, so `bc_dagger1_heights` and the expert's height law both depend
 on it).
 
+### STAGE 1 RESULT (2026-09-09): eval_flight can now score a landing
+
+**STATE: stopped, nothing running.** Only `nanopilot/eval_flight.py` changed.
+No config, world or model changed. `bc_dagger1_heights` re-validated on the
+gate course as a regression of the shared code (below), and it is unchanged.
+
+#### The `land` task
+
+`detect_task` now returns **`"land"`** for a world with a pad and no gates, so
+`landing_target_80mm` scores as a landing rather than a fly-over. `"line"` is
+kept and reachable with `--task=line` -- it completes on HORIZONTAL proximity
+while still airborne, which is the right test for a fly-the-line ablation and
+the wrong one for a task whose last five metres are vertical.
+
+Ground contact is scored by `--touchdown-z` (0.06) instead of `--crash-z`,
+which the land task does not use at all. That is Blocker 2: crash_z is 0.12
+and a textbook landing passes 0.12 on the way down (Stage 0 measured z<0.20 at
+5.4s, touchdown at 8.6s), so the old scorer called every successful landing a
+crash.
+
+`classify_touchdown()` is a PURE FUNCTION -- deliberately, so the scoring rules
+can be tested without a stack -- and splits contact four ways:
+
+| result | test | why it is its own outcome |
+| --- | --- | --- |
+| `completed` | gentle, stopped, on the pad | the only success |
+| `crashed` | `\|vz\| >= --settle-vz` (0.15 m/s) | arrived as a fall |
+| `skidded` | `speed_xy >= --settle-speed` (0.5 m/s) | belly-flop at cruise |
+| `landed_off_pad` | offset > `--pad-radius` | a real landing, wrong place |
+
+`success_rate` therefore keeps meaning what it means for the gates task, and
+each failure gets a name that points at a different fix.
+
+**`skidded` is an addition to the plan's stated criterion and it is
+load-bearing.** The plan specified "inside the pad radius AND z < touchdown_z
+AND \|vz\| < settle_vz". A drone that flies into the ground at 1.5 m/s
+horizontally has a tiny VERTICAL speed at contact and would have scored as a
+successful landing under that rule alone -- a realistic BC failure mode. The
+0.5 m/s default is deliberately generous (a quarter of the 2.0 m/s cruise): its
+job is to refuse to score a belly-flop as a success, not to grade landing style.
+
+**Impact speed is measured over the 0.5s BEFORE contact** (`TOUCHDOWN_VZ_WINDOW_S`),
+not at the contact sample. The pose-derived velocity is low-passed with
+tau=0.1 and the ground stops the drone in one frame, so the sample at contact
+is already decelerating and classifying on it alone scores every impact as
+gentle. Verified against a synthetic hard landing whose contact sample reads
+-0.01 m/s: the window catches the -1.10 and calls it `crashed`.
+
+`--settle-vz = 0.15` sits between the two measured touchdown speeds from Stage
+0 (0.02 m/s at TRIM_RANGE=1.6, 0.18 at 2.0). **If TRIM_RANGE is ever raised
+past 1.6, raise this with it** or every landing scores as a crash.
+
+New metrics per episode and in the aggregate: `touchdown_s`,
+`touchdown_vz_ms`, `touchdown_speed_ms`, `touchdown_pad_offset_m`, plus
+`touchdown_rate`, `skidded_rate`, `landed_off_pad_rate` and
+`max_touchdown_vz_abs_ms`. An episode that never reaches the ground prints
+**NEVER TOUCHED DOWN** with its final distance from the pad, so a fly-over can
+never be confused with a landing at a glance.
+
+#### Verified
+
+- **Offline, no stack:** 8 classification cases (gentle-on-pad, pad edge, just
+  outside, belly-flop, fall, fall-off-pad, the trim-2.0 touchdown speed, and
+  the masked-impact case above) all classify as intended; `detect_task` returns
+  `land` for `landing_target_80mm` and `gates` for all three gate worlds.
+- **Live, real telemetry:** with `--touchdown-z` raised above cruise to force
+  the branch, the touchdown path fires, computes vz/speed/pad offset from the
+  real track, and aggregates. With it at 1.55 the drone held 1.641m and the run
+  correctly reported NEVER TOUCHED DOWN.
+- **Gates regression** (the shared track tuple gained a field, so this was not
+  optional): `bc_dagger1_heights` on `s_curve_heights_80mm`, 3 runs,
+  **3/3 completed, 10/10 gates, height err 0.254m mean / 0.467 max** -- matching
+  the 2026-09-08 record (0.254 / 0.465) to the third decimal. `--trace` arrays
+  are intact and aligned at 560 samples. This also closes the 2026-09-08 open
+  item "`bc_dagger1_heights` was NOT re-evaluated".
+
+#### Stage 1 is complete. Next is Stage 2 (`LineExpert`)
+
+Gate before collecting anything: **>=90% clean landings over 10 episodes**, i.e.
+`success_rate >= 0.9` on the land task. The expert is the ceiling.
+
 ### Two things expected to go wrong
 
 - **The descent eats the clip budget.** It is the only phase that deliberately
