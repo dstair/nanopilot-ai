@@ -92,6 +92,11 @@ def main():
                    help="trim step in metres (must be <= DRONE_ALTITUDE_TRIM_RANGE)")
     p.add_argument("--hold-s", type=float, default=12.0)
     p.add_argument("--start-alt", type=float, default=1.5)
+    p.add_argument("--settle-s", type=float, default=12.0,
+                   help="seconds allowed to reach --start-alt before each gain "
+                        "pair. The takeoff coasts well above 1.5m, so a LOW "
+                        "start-alt needs far longer than the default: the hold "
+                        "is soft (w_n ~0.46) and the descent is unforced.")
     p.add_argument("--airframe", default="80mm")
     p.add_argument("--gains", default=None,
                    help="comma-separated KP:K pairs to sweep in one flight, "
@@ -150,7 +155,7 @@ def main():
         # starts from the same state rather than inheriting the last one's tail.
         env.set_altitude_setpoint(args.start_alt)
         t0 = time.time()
-        while time.time() - t0 < 12:
+        while time.time() - t0 < args.settle_s:
             out = env.run_threaded(0.0, 0.0, 0.0, 0.0)
             if abs(out[POS][2] - args.start_alt) < 0.1 and abs(out[VEL][2]) < 0.1:
                 break

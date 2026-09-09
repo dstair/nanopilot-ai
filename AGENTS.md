@@ -304,6 +304,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `nanopilot/gz_camera_worker.py` | subprocess camera bridge; shared memory, avoids protobuf conflicts |
 | `scripts/probe_hover.py` | takeoff + 30s neutral hold; altitude-hold check |
 | `scripts/probe_alt_step.py` | altitude step response: overshoot, implied w_n/zeta |
+| `scripts/probe_descent.py` | descent authority: ground effect, descent-rate lag, landing profile vs TRIM_RANGE |
 | `scripts/probe_velocity.py` | velocity-cascade step response: signs, gains, cross-axis leakage |
 | `scripts/gate_rollout.py` | flies the expert (`--expert`) or an RL policy; per-gate-crossing lateral/height/speed vs the pass window |
 | `scripts/ff_sweep.py` | sweeps `DRONE_PITCH_THROTTLE_FEEDFORWARD` airborne, climb rate per pitch |
@@ -2199,6 +2200,147 @@ episodes), `torch_train.py`, then `eval_flight`. Expect the established
 pattern: the expert-only student flies on-manifold and fails off it, and one
 DAgger round fixes it. **Judge by `eval_flight` only, never by val loss** --
 DAgger val loss measures the PREVIOUS policy's mistakes (2026-09-07b).
+
+### STAGE 0 RESULT (2026-09-09): probes measured, and the plan's two stated
+### risks are both FALSE. TRIM_RANGE = 1.6 is confirmed by measurement.
+
+**STATE: stopped, nothing running.** No config, world, model or flight
+behaviour changed. What landed: `scripts/probe_descent.py` (new), a `--settle-s`
+flag on `probe_alt_step.py`, and the measurements below. All taken on
+`landing_target_80mm` at the CURRENT gains (Kp=30, K=90, TRIM_RANGE=1.0),
+sweeping trim range IN FLIGHT so the plant was never changed for any course.
+
+#### 1. The hold behaves identically near the ground
+
+`probe_alt_step.py --amplitude=0.25 --hold-s=20` at start-alt 1.5 and 0.6:
+
+| | at 1.5m | at 0.6m |
+| --- | --- | --- |
+| t_cross, +0.15m step | 3.06 / 3.08s | 3.03 / 3.06s |
+| steady-state error | **+0.10m** | **+0.10m** |
+| \|bias\|max (0.6m step) | 18 pwm | 18 pwm |
+| saturated | 0% | 0% |
+
+Not merely similar -- indistinguishable. Nothing about the loop needs
+re-tuning for the low-altitude phase of a landing.
+
+**Probe gotcha found:** `analyse()` reports a bogus overshoot for SMALL steps,
+because the hold's +0.10m residual offset IS 65% of a 0.15m step, so `final ==
+peak` and the implied zeta=0.14 / w_n=0.57 are artifacts. Read the large-step
+leg. The 0.60m leg reports -16% overshoot and +0.10m error, which is the truth.
+
+#### 2. No ground effect, to the resolution of the measurement
+
+Steady-state thrust demand at six setpoints from 1.50m down to 0.25m:
+
+| setpoint | 1.50 | 1.00 | 0.70 | 0.50 | 0.35 | 0.25 |
+| --- | --- | --- | --- | --- | --- | --- |
+| z settled | 1.598 | 1.098 | 0.798 | 0.598 | 0.448 | 0.348 |
+| offset | +0.098 | +0.098 | +0.098 | +0.098 | +0.098 | +0.098 |
+| throttle pwm | 1477.7 | 1477.7 | 1477.7 | 1477.7 | 1477.7 | 1477.7 |
+
+Offset spread **0.001m**, throttle spread **0.1 pwm**. As expected from a
+plugin with no vertical drag and no ground-effect model, but now confirmed
+rather than assumed. Both quantities were measured because either alone could
+be read as drift.
+
+That +0.098m offset is the plant's residual thrust bias divided by Kp: ~3 PWM
+of excess lift at Kp=30. It is a constant of the plant, not an altitude effect.
+
+#### 3. The altitude axis has NO descent-rate command, and that is the finding
+
+The axis commands a target HEIGHT about a frozen setpoint, so the fastest
+descent available is `alt = -1`, aiming at `setpoint - TRIM_RANGE`. Every
+ramped `z_ref` is strictly slower. **Descent speed is therefore a pure function
+of TRIM_RANGE**, and it is bounded by how far BELOW GROUND the target can be
+placed.
+
+Sustaining a descent also costs trim range, because the sim has no vertical
+drag: constant-velocity descent needs zero net force, so the drone must fly a
+steady LAG above its own target. Measured against the prediction, with the
+expert's own height law driving it (Kz=0.75):
+
+    e = ((K/Kp) * r + B/Kp) / (1 + Kz)      B/Kp = the 0.098m residual above
+
+| commanded rate | achieved | predicted lag | **measured lag** |
+| --- | --- | --- | --- |
+| 0.10 m/s | 0.09 | 0.21m | **0.21m** |
+| 0.20 m/s | 0.17 | 0.35m | **0.36m** |
+| 0.30 m/s | 0.25 | 0.48m | **0.48m** |
+
+Agreement to 0.01m. So the command budget is
+`|alt| * TRIM = D + (K/Kp)*Kz*r/(1+Kz)` for a descent of depth D -- **depth and
+rate are spent out of the same trim range**, which is the whole reason
+`TRIM_RANGE` had to rise for this task.
+
+#### 4. Landing profile: TRIM_RANGE = 1.6 lands in 8.6s at 0.02 m/s
+
+`--mode=landing`, full-down command from a 1.5m cruise, trim swept in flight:
+
+| trim | target | z<0.50 | z<0.20 | peak vz | touchdown | touchdown vz | \|bias\|max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **1.6** | **-0.10m** | 3.1s | 5.4s | -0.45 | **8.6s** | **-0.02 m/s** | **49** |
+| 2.0 | -0.50m | 2.3s | 3.3s | -0.56 | 4.0s | -0.18 m/s | 62 |
+| 2.5 | -1.00m | 1.7s | 2.4s | -0.71 | 2.7s | -0.37 m/s | 78 |
+| 3.0 | -1.50m | 1.4s | 1.9s | -0.86 | 2.1s | -0.56 m/s | 90 |
+
+Monotone and well-behaved: a deeper target lands faster and harder, because
+the drone decelerates as it approaches the target and a target just below
+ground is reached asymptotically. **1.6 gives a feather landing (0.02 m/s) in
+8.6s**, which is affordable inside a 60s episode against a ~20m cruise. Nothing
+here argues for going past it; if a future task wants a brisker touchdown, 2.0
+buys 4.0s at a still-gentle 0.18 m/s.
+
+#### Both risks the plan flagged are measurably false
+
+- **"The descent eats the clip budget."** It does not, and not marginally: the
+  +-200 clip on `alt_hold_bias` peaked at **49 pwm at trim 1.6**, and at 90 pwm
+  even at trim 3.0. Saturation was **0% of every leg**, including the ramps.
+  The 2026-09-08b sizing rule `K*vz + Kp*err < 200` is satisfied with room to
+  spare because a descent this loop can command is slow: at K=90 the velocity
+  term needs 2.22 m/s to saturate and the fastest measured descent was 0.86.
+  **Do not spend time defending the clip on this task.** The scarce resource is
+  trim RANGE, not bias headroom -- which is the opposite of the gate-course
+  finding, and only because the gate courses fly fast horizontally.
+- **"The hold might behave differently near the ground."** It does not (1).
+
+#### The one number Stage 1 must respect
+
+`eval_flight.py` calls `pos[2] < crash_z` (default **0.12**) a crash. At trim
+1.6 the drone passes z<0.20 at 5.4s and touches at 8.6s. **A textbook landing
+trips the crash test**, exactly as Blocker 2 predicted -- so the `"land"` task
+must be added before any landing result means anything. Touchdown detection at
+z < 0.06 worked cleanly in the probe and is a usable threshold; measured
+touchdown vz gives `settle_vz` a sane scale (0.02 m/s at trim 1.6, so a
+threshold of ~0.15 m/s separates a landing from a fall).
+
+#### Tooling notes
+
+- **`direct_thrust=0.0` is NOT "no command" -- it is a climb with no damper.**
+  It pins the throttle at exactly hover AND suppresses `alt_hold_bias`
+  entirely, and with no vertical drag the drone then coasts upward forever on
+  its climb momentum. The first run of `probe_descent.py` reached **11m** in
+  its "arrest the climb" phase for this reason. Arrest on the HOLD
+  (`run_threaded(0,0,0,0)`), the way `rl_env._arrest_climb` does.
+  **`scripts/probe_alt_step.py` still has this bug in its takeoff** -- harmless
+  there only because the subsequent settle drags the drone back down, at the
+  cost of ~30s per run.
+- A descent leg must ramp for several time constants (1/w_n ~ 2.1s) or it
+  measures a transient. `probe_descent.py`'s first ramp table reported "0%
+  achieved" at 1.0 m/s purely because a 0.6m ramp at 1.0 m/s is over in 0.6
+  seconds. The leg now refuses to score a ramp shorter than 4s.
+- `probe_alt_step.py` gained `--settle-s`: reaching a LOW start-alt takes far
+  longer than the default 12s, because the takeoff coasts well above it and the
+  descent is unforced.
+
+#### Stage 0 is complete. Next is Stage 1
+
+Nothing measured here changes the plan. Proceed to Stage 1 (add the `"land"`
+task to `eval_flight.py`), then Stage 2 (`LineExpert`), then Stage 3
+(`TRIM_RANGE = 1.6` in config + **re-validate the gate courses**, which is
+still non-negotiable: the trim range rescales what the altitude axis MEANS on
+every course, so `bc_dagger1_heights` and the expert's height law both depend
+on it).
 
 ### Two things expected to go wrong
 
