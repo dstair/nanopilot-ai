@@ -39,6 +39,7 @@ import numpy as np
 
 from autonomous_collect import _wait_for_ready, _wait_for_tcp
 from drone_env import build_drone_env
+from line_expert import LineExpert
 from torch_pilot import TorchPilot
 
 # Matches the hardcoded teleport target in DroneGymEnv._do_reset.
@@ -391,9 +392,16 @@ def takeoff(env, args):
     return True
 
 
-def fly_episode(env, pilot, args, gates, pad_xy, task):
-    """One closed-loop flight. Returns a per-episode result dict."""
-    pilot._imu_history[:] = 0.0
+def fly_episode(env, pilot, args, gates, pad_xy, task, expert=None):
+    """One closed-loop flight. Returns a per-episode result dict.
+
+    `expert` flies a scripted policy instead of a checkpoint, scored by exactly
+    the same rules. That is the point: the expert is the CEILING for anything
+    distilled from it, and a ceiling measured with a different scorer than the
+    student is not a ceiling.
+    """
+    if pilot is not None:
+        pilot._imu_history[:] = 0.0
     tracker = GateTracker(gates) if task == "gates" else None
     track = []
     blank_frames = 0
@@ -464,9 +472,14 @@ def fly_episode(env, pilot, args, gates, pad_xy, task):
 
         if not np.any(image):
             blank_frames += 1
-        # att[2] is yaw in degrees; TorchPilot rotates world velocity into the
-        # heading frame itself, matching how the tub labels were built.
-        yaw, pitch, roll, altitude = pilot.run(image, *imu, *vel, att[2])
+        if expert is not None:
+            # Privileged state, no image: the scripted expert is a pure
+            # function of pose, which is what makes it a free DAgger labeller.
+            yaw, pitch, roll, altitude = expert.act(pos, math.radians(att[2]))
+        else:
+            # att[2] is yaw in degrees; TorchPilot rotates world velocity into
+            # the heading frame itself, matching how the tub labels were built.
+            yaw, pitch, roll, altitude = pilot.run(image, *imu, *vel, att[2])
         if args.zero_altitude:
             # Diagnostic: discard the model's altitude axis and let the vertical
             # damper hold height alone. RL-teacher altitude labels are tiny trims
@@ -655,7 +668,7 @@ def evaluate(cfg, args):
                 "flag, or set DRONE_VELOCITY_CONTROL=False to use it."
             )
 
-    pilot = TorchPilot(
+    pilot = None if args.expert else TorchPilot(
         input_shape=(
             getattr(cfg, "IMAGE_DEPTH", 3),
             getattr(cfg, "TRAIN_IMAGE_H", cfg.IMAGE_H),
@@ -665,12 +678,13 @@ def evaluate(cfg, args):
         altitude_pwm_scale=(getattr(cfg, "DRONE_THROTTLE_SCALE", None)
                             if getattr(cfg, "TRAIN_ALTITUDE_PWM_SPACE", False) else None),
     )
-    pilot.load(args.model)
-    # Warm the inference graph (first MPS call can stall multiple seconds,
-    # which would leave the drone uncontrolled at episode start).
-    dummy = np.zeros((cfg.IMAGE_H, cfg.IMAGE_W, 3), dtype=np.uint8)
-    for _ in range(3):
-        pilot.run(dummy)
+    if pilot is not None:
+        pilot.load(args.model)
+        # Warm the inference graph (first MPS call can stall multiple seconds,
+        # which would leave the drone uncontrolled at episode start).
+        dummy = np.zeros((cfg.IMAGE_H, cfg.IMAGE_W, 3), dtype=np.uint8)
+        for _ in range(3):
+            pilot.run(dummy)
 
     env = build_drone_env(
         cfg,
@@ -680,6 +694,49 @@ def evaluate(cfg, args):
         record_velocity=True,
         record_imu=True,
     )
+    if args.trim_range is not None:
+        # In-flight override of DRONE_ALTITUDE_TRIM_RANGE, so the landing task
+        # can be validated at the range it needs WITHOUT changing the config
+        # and therefore without changing the plant for the gate courses. That
+        # is a separate, gated step. The env reads this every control cycle.
+        print(f"*** TRIM_RANGE OVERRIDE: {env.altitude_trim_range} -> "
+              f"{args.trim_range} (config is NOT changed) ***")
+        env.altitude_trim_range = float(args.trim_range)
+
+    expert = None
+    if args.expert:
+        if task != "land":
+            raise SystemExit(
+                f"--expert flies the scripted LineExpert, which needs the land "
+                f"task; this world scored as '{task}'."
+            )
+        expert = LineExpert.from_env(
+            env, SPAWN[:2], pad_xy,
+            cruise_speed=args.cruise_speed,
+            lookahead=args.lookahead,
+            height_gain=args.height_gain,
+            approach_gain=args.approach_gain,
+            descend_radius=args.descend_radius,
+            land_radius=args.land_radius,
+            ground_target=args.ground_target,
+        )
+        print(
+            f"LineExpert: pad {pad_xy} cruise {args.cruise_speed} m/s "
+            f"lookahead {args.lookahead}m Kz {args.height_gain} "
+            f"approach_gain {args.approach_gain} descend {args.descend_radius}m "
+            f"-> land {args.land_radius}m target {args.ground_target}m "
+            f"trim {env.altitude_trim_range}"
+        )
+        reach = env.altitude_trim_range - (args.start_alt - args.ground_target)
+        if reach < 0:
+            print(
+                f"WARNING: trim range {env.altitude_trim_range} cannot reach "
+                f"{args.ground_target}m from a {args.start_alt}m cruise (short "
+                f"by {-reach:.2f}m). The command will clip at -1 and the drone "
+                f"will hover at {args.start_alt - env.altitude_trim_range:.2f}m "
+                f"instead of landing."
+            )
+
     update_thread = threading.Thread(target=env.update, daemon=True)
     update_thread.start()
 
@@ -701,7 +758,7 @@ def evaluate(cfg, args):
                     f"{args.start_alt}m within {args.takeoff_timeout}s"
                 )
                 continue
-            episode = fly_episode(env, pilot, args, gates, pad_xy, task)
+            episode = fly_episode(env, pilot, args, gates, pad_xy, task, expert)
             episode["episode"] = i + 1
             episodes.append(episode)
             summary = f"{episode['result']} after {episode['survival_s']}s"
@@ -738,7 +795,7 @@ def evaluate(cfg, args):
         update_thread.join(timeout=3.0)
 
     report = {
-        "model": args.model,
+        "model": args.model or "scripted:LineExpert",
         "world": world,
         "task": task,
         "airframe": args.airframe,
@@ -764,7 +821,7 @@ def evaluate(cfg, args):
         json.dump(report, f, indent=2)
 
     print()
-    print(f"=== eval_flight: {args.model} on {world} ({task}) ===")
+    print(f"=== eval_flight: {report['model']} on {world} ({task}) ===")
     for key, value in report["aggregate"].items():
         print(f"  {key}: {value}")
     print(f"JSON: {json_path}")
@@ -773,7 +830,34 @@ def evaluate(cfg, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Closed-loop Nanopilot autopilot eval")
-    parser.add_argument("--model", required=True, help="TorchPilot .pth checkpoint")
+    parser.add_argument("--model", default=None, help="TorchPilot .pth checkpoint")
+    parser.add_argument("--expert", action="store_true",
+                        help="fly the scripted LineExpert instead of a "
+                             "checkpoint, scored by the same rules. Use this to "
+                             "establish the ceiling before distilling anything")
+    parser.add_argument("--trim-range", type=float, default=None, metavar="M",
+                        help="override DRONE_ALTITUDE_TRIM_RANGE in flight, "
+                             "without touching the config (and so without "
+                             "changing the plant for any other course)")
+    parser.add_argument("--cruise-speed", type=float, default=1.5,
+                        help="--expert: cruise speed along the line (m/s)")
+    parser.add_argument("--lookahead", type=float, default=3.0,
+                        help="--expert: pure-pursuit lookahead (m)")
+    parser.add_argument("--height-gain", type=float, default=0.75,
+                        help="--expert: Kz, matching GateExpert's default")
+    parser.add_argument("--approach-gain", type=float, default=0.6,
+                        help="--expert: speed = approach_gain * distance to "
+                             "pad, capped at cruise (1/s)")
+    parser.add_argument("--descend-radius", type=float, default=8.0,
+                        help="--expert: start descending inside this radius "
+                             "(m). A GLIDE SLOPE, sized so the pad stays in "
+                             "the camera -- see line_expert's docstring")
+    parser.add_argument("--land-radius", type=float, default=0.5,
+                        help="--expert: full-down command inside this radius (m)")
+    parser.add_argument("--ground-target", type=float, default=-0.1,
+                        help="--expert: height reference at the pad (m). Below "
+                             "ground on purpose -- aiming at 0.0 approaches "
+                             "asymptotically and never touches down")
     parser.add_argument("--airframe", choices=["65mm", "80mm"], default="80mm")
     parser.add_argument("--myconfig", default=None)
     parser.add_argument(
@@ -839,6 +923,8 @@ def main():
                              "than this is landed_off_pad, not a success")
     parser.add_argument("--json-output", default=None, help="metrics JSON path (default logs/eval_flight_<ts>.json)")
     args = parser.parse_args()
+    if bool(args.model) == bool(args.expert):
+        parser.error("give exactly one of --model or --expert")
 
     myconfig = args.myconfig or f"drone_config_{args.airframe}.py"
     cfg = dk.load_config(

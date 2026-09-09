@@ -203,7 +203,7 @@ uv run --env-file .env python -m py_compile \
   nanopilot/torch_train.py nanopilot/evaluate.py nanopilot/smoke_test.py \
   nanopilot/test_thrust.py nanopilot/eval_flight.py \
   nanopilot/rl_env.py nanopilot/rl_train.py nanopilot/rl_collect.py \
-  nanopilot/dagger_collect.py nanopilot/gate_expert.py \
+  nanopilot/dagger_collect.py nanopilot/gate_expert.py nanopilot/line_expert.py \
   nanopilot/gz_reset_worker.py nanopilot/gz_camera_worker.py \
   scripts/gate_rollout.py scripts/ff_sweep.py scripts/detach_launch.py \
   scripts/promote_checkpoint.py scripts/alt_phase.py \
@@ -296,6 +296,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `nanopilot/test_thrust.py` | hover, damper, attitude, lateral-coast test logic |
 | `nanopilot/eval_flight.py` | closed-loop autopilot eval: survival/progress/gate metrics, JSON |
 | `nanopilot/gate_expert.py` | scripted pure-pursuit gate expert over velocity setpoints |
+| `nanopilot/line_expert.py` | scripted line-follow + landing expert; glide slope sized by camera FOV |
 | `nanopilot/rl_env.py` | `GateChaseEnv`: state-based Gymnasium env over a live DroneGymEnv |
 | `nanopilot/rl_train.py` | PPO trainer for the state-based RL gate teacher |
 | `nanopilot/rl_collect.py` | flies the expert (`--expert`) or an RL teacher, records tubs for BC distillation |
@@ -2422,6 +2423,120 @@ never be confused with a landing at a glance.
 
 Gate before collecting anything: **>=90% clean landings over 10 episodes**, i.e.
 `success_rate >= 0.9` on the land task. The expert is the ceiling.
+
+### STAGE 2 RESULT (2026-09-09): LineExpert flies it 10/10, and the glide
+### slope had to be sized by the CAMERA, not by the plant
+
+**STATE: stopped, nothing running.** New `nanopilot/line_expert.py`;
+`eval_flight.py` gains `--expert` and `--trim-range`. **No config changed** --
+the trim range is overridden IN FLIGHT, so the plant is untouched for every
+other course. That is still Stage 3's job.
+
+#### Gate: PASSED, 10/10 clean landings (required >=90%)
+
+`eval_flight.py --expert --trim-range=1.6 --runs=10 --duration=60 --rate-hz=20`:
+
+    success_rate 1.0   crash_rate 0.0   skidded 0.0   landed_off_pad 0.0
+    mean 18.60s   touchdown vz -0.032 m/s   0.045m from pad centre
+    cross-track mean 0.014m
+
+Ten for ten, and repeatable to the third decimal (pad offset 0.038-0.054m,
+touchdown vz -0.029..-0.034). For scale, the pad is a 0.5m box inside a 1.5m
+visual disc and `--pad-radius` is 1.0m, so the expert touches down 20x tighter
+than the scoring window.
+
+#### The law
+
+Three parts, all pure functions of privileged state -- no phase variable, no
+timer, no latch -- so `act()` is reproducible from state alone and DAgger can
+label a drone that has drifted back off the pad with "climb and go round"
+rather than with whatever phase it was last in.
+
+  * **Horizontal:** pure pursuit along the line, carrot clamped at the pad.
+    Same as `GateExpert`'s centerline pursuit, and it is what keeps the
+    guidance line under the camera.
+  * **Speed:** a proportional POSITION loop, `v = min(cruise, 0.6 * d_pad)`, so
+    the drone eases in and stops over the pad rather than arriving at cruise
+    and needing to be caught.
+  * **Height:** a reference ramping from cruise to a target BELOW GROUND
+    (-0.1m), through the same feed-forward-plus-proportional law the gate
+    expert uses, at the same validated Kz = 0.75.
+
+Two details are load-bearing and were arrived at by failing at them on paper
+first:
+
+  * **The height ramp SATURATES at `land_radius` (0.5m); it does not taper to
+    the target.** The hold settles ~0.10m above whatever it is asked for (the
+    plant's residual bias over Kp, Stage 0), so a reference that only reaches
+    the ground target as d -> 0 leaves a drone hovering 0.3m off centre parked
+    at z ~ 0.2m forever, scoring NEVER TOUCHED DOWN.
+  * **`ground_target` is below ground on purpose.** Descent speed is set purely
+    by how far below ground the target sits, because the axis commands a height
+    and not a rate (Stage 0). Aiming at exactly 0.0 approaches asymptotically
+    and never arrives.
+
+#### The glide slope is sized by the CAMERA, and this is the reusable lesson
+
+The first tuning (`descend_radius = 2.0`) flew level to the pad and then
+descended vertically on the spot. It landed 10/10 at 0.075m. **It was still the
+wrong expert**, because it generates bad DATA: the camera is forward-facing,
+140 deg horizontal, which at 4:3 is **+-64 deg vertically**. A drone 0.3m from
+the pad at 1.5m sees it at **78.7 deg depression -- out of frame** -- and the
+pad only reappears below ~0.6m. That is exactly the 2026-09-06b failure ("the
+target is outside the camera at the moment of the turn") pointed at the pad
+instead of a gate, and it would have been discovered in Stage 4 as an
+unexplained student failure.
+
+Descending ALONG the approach fixes it. Measured, one episode each at trim 1.6:
+
+| descend_radius | duration | pad offset | pad out of frame | alt label on the ramp |
+| --- | --- | --- | --- | --- |
+| 2m (level, then vertical) | 20.9s | 0.075m | **16.7%** | 6.1% |
+| **8m (glide) -- DEFAULT** | **18.5s** | **0.048m** | **3.3%** | **22.7%** |
+| 12m (glide) | 17.4s | 0.165m | 2.3% | 37.8% |
+
+8m wins on every axis at once, so it is the default and the 10-episode gate
+above was re-run at it. 12m descends so early that the drone arrives low and
+still moving, which costs touchdown accuracy. The residual 3.3% out-of-frame is
+the last few centimetres directly over the pad, by which point the drone is
+committed.
+
+**The altitude label shape is the second reason to prefer the glide.** At 2m
+the label is nearly binary -- 53.7% at ~0 and 40.2% pinned at exactly -1.0,
+with only 6.1% on the continuous ramp between -- so the student would have to
+learn a switch triggered by a visual cue that is out of frame when it fires. At
+8m, 22.7% of the episode is on the ramp. **This also revises the plan's
+expectation that the landing would be a brief event needing loss re-weighting:
+the descent is 8.8s of an 18.6s episode. `TRAIN_LOSS_WEIGHTS` should stay
+uniform until flight data says otherwise.**
+
+#### eval_flight gains --expert and --trim-range
+
+`--expert` flies `LineExpert` and is scored **by exactly the same rules as a
+checkpoint**. That is the point: the expert is the ceiling for anything
+distilled from it, and a ceiling measured with a different scorer is not a
+ceiling. It refuses to run on a non-`land` world.
+
+`--trim-range` overrides `DRONE_ALTITUDE_TRIM_RANGE` in flight and prints a
+loud banner. It exists so this stage could be validated at 1.6 without changing
+the plant for the gate courses, and it warns explicitly when the range cannot
+reach `ground_target` from the cruise height.
+
+At the CURRENT config (1.0) the expert cannot land at all, by construction: the
+command clips at -1 and the drone hovers at `start_alt - 1.0` = 0.5m, which the
+land scorer reports as NEVER TOUCHED DOWN. That failure is self-diagnosing
+rather than silent, which is deliberate.
+
+#### Stage 2 is complete. Next is Stage 3
+
+Set `DRONE_ALTITUDE_TRIM_RANGE = 1.6` in `drone_config_80mm.py` and **re-validate
+the gate courses** -- non-negotiable, and now with a concrete expectation to
+check against: the trim range rescales what the altitude axis MEANS, so
+`GateExpert`'s commands on `s_curve_heights_80mm` all shrink by 1/1.6 while
+meaning the same height, and `bc_dagger1_heights` (trained at 1.0) will be
+commanding 1.6x the height offset it intends. **Expect the existing student to
+regress and require retraining; that cost was accepted when option C was
+chosen.** The gate to check is the EXPERT at 10/10, not the student.
 
 ### Two things expected to go wrong
 
