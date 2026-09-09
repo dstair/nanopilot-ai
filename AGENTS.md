@@ -4,15 +4,22 @@ Concise runbook for coding agents working in this repo. Use `README.md` for
 project overview, setup details, and public-facing docs. Keep this file focused
 on agent workflow, sharp edges, and the current handoff.
 
+**Maintenance.** This file is loaded into context every session, so it has a
+budget: keep it under ~150k characters. When adding a handoff, fold the
+now-superseded one into `## Historical Record` — keep the decision and any
+lesson that still binds, drop the blow-by-blow (git history has it). Before
+committing, check `wc -c AGENTS.md`, and check you have not pasted a section
+that already exists: this file once carried the same 197-line block **eight
+times**, which was a third of its total size.
+
 ## Fresh Session Checklist
 
 1. Read the newest `## Current Handoff` section at the bottom.
-1b. **Check whether an RL run is training right now** before touching the sim
-   or starting anything that needs BetaFlight/Gazebo — a long run may be in
-   progress and any stack command will fight it for UDP 9004:
+1b. **Check whether a long run is in progress** before touching the sim or
+   starting anything that needs BetaFlight/Gazebo — any stack command will
+   fight it for UDP 9004:
    ```bash
-   pgrep -fl rl_train.sh
-   tail -3 logs/rl_train_ppo_gates_v4.log
+   pgrep -fl 'rl_train.sh|rl_collect|dagger_collect|eval_flight|torch_train'
    ```
    If one is alive, do NOT run `stop_all.sh`, `start.sh`, or any flight
    script until you have checked with the user.
@@ -40,12 +47,18 @@ previous-control data. It is developed for native Apple Silicon.
 
 DonkeyCar key names map to drone controls as:
 
-| Key | Meaning |
-| --- | --- |
-| `steering [-1, 1]` | yaw rate |
-| `throttle [-1, 1]` | forward pitch / tilt |
-| `roll [-1, 1]` | lateral roll / bank |
-| `altitude [-1, 1]` | motor throttle around hover PWM |
+| Key | Meaning under `DRONE_VELOCITY_CONTROL` (80mm) | Meaning in direct mode (65mm) |
+| --- | --- | --- |
+| `steering [-1, 1]` | yaw rate | yaw rate |
+| `throttle [-1, 1]` | forward speed, fraction of `DRONE_MAX_FORWARD_SPEED` | forward pitch / tilt |
+| `roll [-1, 1]` | rightward speed, fraction of `DRONE_MAX_LATERAL_SPEED` | lateral roll / bank |
+| `altitude [-1, 1]` | LINEAR height trim, in metres of `DRONE_ALTITUDE_TRIM_RANGE` | motor throttle around hover PWM, via a 0.2-power curve |
+
+The 80mm airframe sets `DRONE_VELOCITY_CONTROL = True`, so the env closes the
+inner loop and the model regresses SETPOINTS, not stick deflections. 65mm does
+not set it and is still direct-angle. `run_threaded(..., direct_thrust=X)`
+bypasses the height hold with the old curve — every takeoff/landing ramp needs
+it, because a ramp cannot be expressed as a height trim.
 
 The current model output is four-axis: `[steering, throttle, roll, altitude]`.
 Older three-output checkpoints are not runtime-compatible with the current
@@ -85,20 +98,52 @@ bash ./scripts/stop_all.sh
 
 # One-command closed-loop autopilot eval: headless stack, TorchPilot flies
 # N episodes, scored from Gazebo ground truth (survival/progress/gates), JSON out
-./scripts/eval_flight.sh --model=models/bc_v4.pth --world=landing_target_80mm --runs=3
+./scripts/eval_flight.sh --model=models/bc_dagger1_heights.pth \
+  --world=s_curve_heights_80mm --runs=5 --duration=60 --rate-hz=20
+```
 
-# RL teacher: bounded PPO smoke run (headless stack + train + teardown)
-./scripts/rl_train.sh --total-steps=1200 --n-steps=256 --batch-size=64 \
-  --checkpoint-every=512 --out=models/rl/smoke
+### The current pipeline: scripted expert -> BC -> DAgger
 
-# RL teacher: long run. Self-supervising — rebuilds the stack and resumes from
-# checkpoint if BetaFlight dies. The altitude flags are REQUIRED: without them
-# the policy cannot hold gate height and will never pass a gate (see the
-# newest handoff). Launch via detach_launch.py so a killed shell doesn't take
-# the trainer down with it.
-./scripts/rl_train.sh --total-steps=400000 --out=models/rl/ppo_gates_v4 \
-  --control-altitude --altitude-scale=0.09
+No RL run is needed. `GateExpert` is a pure function of privileged state, so it
+needs no training, no checkpoint selection, and it labels any state on demand.
 
+```bash
+# 0. Bring the stack up, WAIT ~25s, then gate on MSP health before any long run
+GZ_HEADLESS=1 GZ_WORLD=s_curve_heights_80mm ./scripts/start.sh \
+  --no-manage --airframe=80mm
+uv run --env-file .env python -c "
+import sys; sys.path.insert(0,'nanopilot')
+from utils.betaflight import MSPClient
+print(MSPClient().query_status(timeout=2.0))"
+# (None, [], None, []) means rebuild the stack NOW. Read the output; do not
+# just run it. A dead board wastes the whole collection.
+
+# 1. Sanity-check the expert on the course (no policy files needed)
+uv run --env-file .env python scripts/gate_rollout.py --expert --episodes=5
+
+# 2. Collect expert rollouts -> tub  (~100% yield, ~25 min for 40 episodes)
+uv run --env-file .env python nanopilot/rl_collect.py \
+  --expert --episodes=40 --min-gates=10
+
+# 3. Train the student
+uv run --env-file .env python nanopilot/torch_train.py \
+  --tubs=data/<expert_tub> --model=models/bc_expert_vN.pth
+
+# 4. DAgger: fly the STUDENT, label with the EXPERT. This is what makes the
+#    student actually complete a course — an expert-only tub has zero
+#    corrective data because the expert never fails.
+uv run --env-file .env python nanopilot/dagger_collect.py \
+  --expert --student=models/bc_expert_vN.pth --episodes=30
+
+# 5. Retrain on BOTH tubs aggregated, then eval.
+#    Judge a DAgger round by eval_flight ONLY, never by val loss.
+uv run --env-file .env python nanopilot/torch_train.py \
+  --tubs=data/<expert_tub>,data/<dagger_tub> --model=models/bc_dagger1_vN.pth
+```
+
+### Probes and diagnostics
+
+```bash
 # Altitude hold check: healthy = roughly constant z for 30s at neutral
 uv run --env-file .env python scripts/probe_hover.py
 
@@ -107,19 +152,15 @@ uv run --env-file .env python scripts/probe_hover.py
 GZ_WORLD=s_curve_heights_80mm uv run --env-file .env python \
   scripts/probe_alt_step.py --amplitude=0.5
 
+# Velocity cascade: signs, gains, cross-axis leakage, and a yaw-rate leg that
+# FAILS on a wrong sign or a mis-scaled full-stick rate
+uv run --env-file .env python scripts/probe_velocity.py
+
 # Why is the policy missing gates? Per-crossing lateral/height/speed vs the
 # pass window (needs a running stack)
-uv run --env-file .env python scripts/gate_rollout.py \
-  --policy=models/rl/ppo_gates_v4 --model=model.zip \
-  --vecnorm=models/rl/ppo_gates_v4/vecnorm.pkl --episodes=6
+uv run --env-file .env python scripts/gate_rollout.py --expert --episodes=6
 
-# Distill a trained RL teacher into vision tubs for torch_train.py
-# NOTE: --min-gates=3 currently yields ZERO episodes; use 2.
-GZ_HEADLESS=1 GZ_WORLD=slalom_gates_80mm ./scripts/start.sh --no-manage --airframe=80mm
-uv run --env-file .env python nanopilot/rl_collect.py \
-  --policy=models/rl/ppo_gates_v4 --episodes=40 --min-gates=2
-
-# Scripted no-human collection + bounded training
+# Scripted no-human collection + bounded training (direct-angle mode only)
 ./scripts/collect_train.sh --airframe=80mm --duration=30 --max-epochs=5 \
   --model=models/scripted_autonomous.pth
 
@@ -162,20 +203,27 @@ uv run --env-file .env python -m py_compile \
   nanopilot/torch_train.py nanopilot/evaluate.py nanopilot/smoke_test.py \
   nanopilot/test_thrust.py nanopilot/eval_flight.py \
   nanopilot/rl_env.py nanopilot/rl_train.py nanopilot/rl_collect.py \
-  nanopilot/gate_expert.py \
+  nanopilot/dagger_collect.py nanopilot/gate_expert.py \
+  nanopilot/gz_reset_worker.py nanopilot/gz_camera_worker.py \
   scripts/gate_rollout.py scripts/ff_sweep.py scripts/detach_launch.py \
-  scripts/probe_velocity.py scripts/probe_alt_step.py
+  scripts/promote_checkpoint.py scripts/alt_phase.py \
+  scripts/probe_hover.py scripts/probe_velocity.py scripts/probe_alt_step.py
 
 uv run --env-file .env python nanopilot/torch_train.py --help
 uv run --env-file .env python nanopilot/evaluate.py --help
 uv run --env-file .env python nanopilot/autonomous_collect.py --help
 
+# TorchPilot load + forward. Note ALL THREE details: nanopilot/ on sys.path,
+# the model built at 120x160 (NOT the 640x480 camera size), and run() taking
+# velocity + yaw. Verified 2026-09-08; prints 4 floats.
 uv run --env-file .env python - <<'PY'
+import sys; sys.path.insert(0, 'nanopilot')
 import numpy as np
-from nanopilot.torch_pilot import TorchPilot
-pilot = TorchPilot(input_shape=(3, 480, 640), seq_len=3)
-pilot.load('models/tub_5_26-05-17.pth')
-print(tuple(round(float(v), 6) for v in pilot.run(np.zeros((480, 640, 3), dtype=np.uint8))))
+from torch_pilot import TorchPilot
+pilot = TorchPilot(input_shape=(3, 120, 160), seq_len=3)
+pilot.load('models/bc_dagger1_heights.pth')
+out = pilot.run(np.zeros((480, 640, 3), dtype=np.uint8), vel_x=1.0, yaw_deg=0.0)
+print(tuple(round(float(v), 6) for v in out))
 PY
 ```
 
@@ -250,20 +298,27 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `nanopilot/gate_expert.py` | scripted pure-pursuit gate expert over velocity setpoints |
 | `nanopilot/rl_env.py` | `GateChaseEnv`: state-based Gymnasium env over a live DroneGymEnv |
 | `nanopilot/rl_train.py` | PPO trainer for the state-based RL gate teacher |
-| `nanopilot/rl_collect.py` | flies a trained RL teacher, records tubs for BC distillation |
+| `nanopilot/rl_collect.py` | flies the expert (`--expert`) or an RL teacher, records tubs for BC distillation |
+| `nanopilot/dagger_collect.py` | flies the STUDENT, labels each state with the expert — the DAgger collector |
 | `nanopilot/gz_reset_worker.py` | persistent subprocess issuing gz set_pose teleports |
+| `nanopilot/gz_camera_worker.py` | subprocess camera bridge; shared memory, avoids protobuf conflicts |
 | `scripts/probe_hover.py` | takeoff + 30s neutral hold; altitude-hold check |
 | `scripts/probe_alt_step.py` | altitude step response: overshoot, implied w_n/zeta |
 | `scripts/probe_velocity.py` | velocity-cascade step response: signs, gains, cross-axis leakage |
-| `scripts/gate_rollout.py` | flies a trained RL policy; per-gate-crossing lateral/height/speed vs the pass window |
+| `scripts/gate_rollout.py` | flies the expert (`--expert`) or an RL policy; per-gate-crossing lateral/height/speed vs the pass window |
 | `scripts/ff_sweep.py` | sweeps `DRONE_PITCH_THROTTLE_FEEDFORWARD` airborne, climb rate per pitch |
 | `scripts/detach_launch.py` | `os.setsid()` launcher; long runs survive process-group kills |
+| `scripts/promote_checkpoint.py` | promotes the newest RL checkpoint to `model.zip`/`vecnorm.pkl` |
+| `scripts/alt_phase.py` | altitude period/phase analysis: damping vs position feedback vs lag |
 | `scripts/start.sh` | stack launcher |
+| `scripts/start_gated.sh` | stack launcher that REFUSES to hand over an MSP-deaf BetaFlight; rebuilds until healthy |
 | `scripts/stop_all.sh` | stack cleanup |
 | `scripts/test_thrust.sh` | launches stack, runs `test_thrust.py`, tears down |
 | `scripts/eval_flight.sh` | launches stack, runs `eval_flight.py`, tears down |
 | `scripts/rl_train.sh` | supervisor: launches stack, runs `rl_train.py`, rebuilds+resumes on failure |
-| `worlds/s_curve_heights_80mm.sdf` | 10-gate varied-height S-curve; per-gate pass window |
+| `worlds/s_curve_heights_80mm.sdf` | 10-gate varied-height S-curve; per-gate pass window. **Current benchmark** |
+| `worlds/s_curve_gates_80mm.sdf` | 10-gate flat S-curve; same x/y/yaw, so height is the only difference |
+| `worlds/slalom_gates_80mm.sdf` | retired 3-gate slalom; kept for historical comparison |
 | `worlds/*_80mm.sdf` | 80mm worlds |
 | `worlds/drone_course_65mm.sdf` | retained 65mm Air65 world |
 
@@ -298,12 +353,39 @@ External paths that matter:
 ## Current Airframe/Control State
 
 - 80mm Pavo Pico II is the default airframe, modeled at about 79g AUW.
-- 65mm Air65 remains available for comparison.
-- Current image resolution is `640x480` in both airframe configs.
-- 80mm hover bias remains `DRONE_HOVER_THROTTLE = 1475`.
-- 80mm vertical damper: `DRONE_ALTITUDE_HOLD_K = 45.0`.
-- 80mm pitch throttle feed-forward: `DRONE_PITCH_THROTTLE_FEEDFORWARD = 8.0`.
-- 65mm pitch feed-forward is still `0.0` unless separately validated.
+- 65mm Air65 remains available for comparison, but has NOT been re-tested
+  airborne since the pitch/roll PID retune or the yaw-scale correction.
+- Camera is `640x480`; models train and infer at `TRAIN_IMAGE_H/W = 120x160`.
+  **Build `TorchPilot`/`LinearModel` at 120x160, never at the camera size** —
+  `AdaptiveAvgPool` accepts the wrong size silently and predicts badly.
+- 80mm camera `horizontal_fov` is **2.44346 rad (140 deg)**, set in the model
+  SDF outside this repo. Tubs recorded before that change are wrong optics.
+
+80mm control values (all in `nanopilot/drone_config_80mm.py`; verified
+2026-09-08 against the file):
+
+| setting | value | note |
+| --- | --- | --- |
+| `DRONE_VELOCITY_CONTROL` | `True` | env closes the inner loop; model emits setpoints |
+| `DRONE_HOVER_THROTTLE` | 1480 | re-measured after taming the BF PIDs |
+| `DRONE_ALTITUDE_HOLD_K` | 90.0 | velocity term |
+| `DRONE_ALTITUDE_HOLD_KP` | 30.0 | **position term — this is what makes the plant safe** |
+| `DRONE_ALTITUDE_TRIM_RANGE` | 1.0 | metres of setpoint authority in-deadband; still un-swept |
+| `DRONE_ALTITUDE_HOLD_DEADBAND` | 0.1 | outside it the command is direct thrust |
+| `DRONE_PITCH_THROTTLE_FEEDFORWARD` | 2.0 | swept airborne; higher values climb |
+| `DRONE_YAW_THROTTLE_FEEDFORWARD` | 0.0 | correct — yaw-induced thrust is now ~0.3 PWM |
+| `DRONE_MAX_PITCH_ANGLE` / `ROLL` | 20.0 / 10.0 | roll buys half the accel of pitch |
+| `DRONE_MAX_YAW_RATE` | 120.0 | delivers 120 deg/s only since the 0.60 scale fix |
+| `DRONE_MAX_FORWARD_SPEED` / `LATERAL` | 2.0 / 1.0 m/s | at full stick |
+| `DRONE_VELOCITY_KP/KFF_FWD` | 0.6 / 0.35 | measured, do not guess |
+| `DRONE_VELOCITY_KP/KFF_LAT` | 1.2 / 0.8 | lateral rise is authority-limited, not gain-limited |
+| `TRAIN_ALTITUDE_PWM_SPACE` | `False` | **must go back ON if `DRONE_VELOCITY_CONTROL` goes off** |
+| `TRAIN_LOSS_WEIGHTS` | `[1,1,1,1]` | uniform; do not re-tune without flight data |
+| `EARLY_STOP_PATIENCE` / `SMOOTH_WINDOW` | 15 / 3 | **these two must move together** |
+
+- 65mm pitch feed-forward is still `0.0`; it sets neither
+  `DRONE_ALTITUDE_HOLD_KP` nor `DRONE_VELOCITY_CONTROL`, so it keeps the old
+  pure-velocity damper and direct-angle sticks.
 - External model/plugin drag currently:
   - `<horizontalVelocityDecay>0.35</horizontalVelocityDecay>`
   - `<horizontalQuadraticDrag>0.05</horizontalQuadraticDrag>`
@@ -320,9 +402,10 @@ RC channels use AETR:
 | CH5/AUX1 | arm |
 | CH6/AUX2 | Angle mode |
 
-Keyboard/web controls:
+Keyboard/web controls (the axis meanings follow the table in Project
+Essentials — on 80mm these are setpoints, not stick deflections):
 
-- Up/down: altitude / motor throttle
+- Up/down: altitude
 - Left/right: yaw
 - `j`/`l`: roll
 
@@ -338,2665 +421,246 @@ Xbox controls:
 
 ## Data And Models
 
-Useful local data:
+**Current best model: `models/bc_dagger1_heights.pth`** — flies
+`s_curve_heights_80mm` 10/10 gates, 5/5 episodes, at expert pace.
 
-- `data/tub_3_26-05-09`: best older training tub, `3368` rows/images,
-  complete nonzero IMU, but old data has roll as zero.
-- `data/tub_4_26-05-09`: small held-out smoke/eval tub, `161` rows/images.
-- `data/tub_14_26-05-16`: 640x480 scripted 80mm collection smoke, `30` images.
+Current tubs (all 140-deg optics, velocity-setpoint interface, PD altitude
+hold — i.e. the only ones safe to train on today):
 
-Useful local models:
-
-- `models/tub_5_26-05-17.pth`: current four-output checkpoint that loads with
-  `TorchPilot` at `640x480`, `seq_len=3`.
-- `models/tub_5_26-05-17_seqlen7.pth`: four-output checkpoint trained with a
-  longer sequence length.
-- `models/hello_world_tub3.pth`: older bounded smoke checkpoint from `tub_3`;
-  useful historically, but not compatible with current four-output runtime.
-- `models/tub_3_26-05-09_full.pth`: full older 3-axis-era tub training result;
-  no longer compatible after four-output roll change unless retrained/migrated.
-- `models/pilot.pth`: older baseline.
-
-## Current Handoff (2026-08-07)
-
-Landing-target behavior-cloning iteration (prior handoff: quadratic drag work,
-see git history).
-
-Data and models:
-
-- `data/tub_12_26-08-06`: 1715 frames, landing_target_80mm, recorded at the
-  old 45-degree max pitch. Gentle demo (mean pitch cmd 0.148, 59% zero).
-- `data/tub_13_26-08-07`: 2870 frames, landing_target_80mm, recorded at the
-  new 20-degree max pitch, more roll corrections (15% of frames).
-- `models/tub_12_26-08-06.pth`: trained fresh on tub_12, best val 0.0112.
-- `models/tub_13_26-08-07_ft.pth`: fine-tuned from tub_12 model on tub_13
-  (`--init-weights`, lr 3e-4), best val 0.0088.
-
-eval_flight baselines on landing_target_80mm (pad at 20m):
-
-- tub_12 model, 30s x3: 0 crashes, along-track mean 3.75m, cross-track 0.25m.
-- tub_12 model, 90s x3: 0 crashes, along-track 11.0m (pace is linear,
-  ~0.12 m/s — clones the slow demo), cross-track grows to 0.80m mean /
-  1.6m max, altitude sags 2.40 -> 2.16m over the episode.
-- tub_13 fine-tune (`tub_13_26-08-07_ft.pth`) 90s x3: all crashed ~17.5s.
-  Commands roll ~0.8 from the first pilot frame at the eval start pose and
-  flies sideways ~20m until attitude-crash. Offline evaluate.py on tub_13 is
-  fine (pitch corr 0.95, roll MAE 0.07) — closed-loop distribution shift +
-  forgetting of tub_12 behavior, not broken weights.
-- combined fresh train (`tub_12_13_combined.pth`, both tubs) 90s x3: all
-  crashed, 2 of 3 sinking to the floor within ~5s while commanding near-zero
-  altitude. Val was noisy, best epoch was epoch 1 — likely label conflict:
-  tub_12 was recorded at the 45-degree pitch mapping, tub_13 at 20 degrees,
-  so similar frames carry ~2.25x different command labels for the same
-  physical maneuver. Don't mix tubs across the mapping change without
-  rescaling labels.
-- Best flying model remains `models/tub_12_26-08-06.pth`.
-
-Config/infra changes this session:
-
-- `drone_config_80mm.py`: `DRONE_MAX_PITCH_ANGLE`/`DRONE_MAX_ROLL_ANGLE`
-  45 -> 20 (keyboard pilots can't hold partial pitch; full deflection is now a
-  comfortable cruise). `DRONE_PITCH_THROTTLE_FEEDFORWARD` 8 -> 7. Models
-  trained on 45-degree-era tubs fly slower under this mapping — don't compare
-  eval numbers across the change.
-- `nanopilot/eval_flight.py request_reset`: re-issues the gz set_pose reset
-  every 2s until the pose sticks; a single dropped 1s service call used to
-  kill the whole eval.
-- `scripts/start.sh start_betaflight`: retries raised 2 -> 5 with 2s pauses.
-  BetaFlight SITL intermittently aborts at launch (heap corruption in
-  openSerialPort/stream_initAddress, macOS ARM64). Random per launch; not
-  eeprom, not config. Crash reports in `~/Library/Logs/DiagnosticReports/`.
-
-Follow-ups:
-
-1. Collect more 20-degree-era landing_target tubs (varied start views,
-   deliberate centerline-recovery maneuvers, some altitude activity) and train
-   fresh on those alone; don't mix with 45-degree-era tub_12 unless labels are
-   rescaled by 45/20.
-2. Consider evaluating a fresh (non-fine-tuned) train on tub_13 alone before
-   collecting more.
-3. Lateral-coast maneuver still climbs in Z; consider roll-tilt throttle
-   compensation like the pitch feed-forward.
-4. Verify `DRONE_PITCH_THROTTLE_FEEDFORWARD=7` doesn't over/under-compensate
-   altitude at the 20-degree mapping (damper-sim mode of test_thrust.sh).
-
-## Current Handoff (2026-08-22)
-
-RL teacher-student pipeline built and smoke-tested (prior handoff:
-landing-target BC iteration, above).
-
-Plan: state-based PPO "teacher" learns gate flying from privileged Gazebo
-ground truth (no camera — feasible at real-time sim speed), then
-`rl_collect.py` flies the teacher to generate tubs and the existing BC
-pipeline distills it into a deployable vision model. Direct pixel RL was
-rejected: sim is real-time-locked (~70k steps/hour at 20Hz), pixel PPO needs
-millions of steps.
-
-New pieces:
-
-- `nanopilot/rl_env.py`: `GateChaseEnv` — 20-dim state obs (gate-relative
-  position/heading, velocity, attitude, gyro, prev action, next gate), gate
-  progress/pass/miss/crash rewards, jittered spawns, calm-verified resets.
-- `nanopilot/rl_train.py`: PPO/MlpPolicy + VecNormalize + checkpoints; out
-  dir gets `model.zip` + `vecnorm.pkl`. `--resume=<out dir>` continues
-  (NOTE: on resume `--total-steps` means ADDITIONAL steps, SB3 semantics).
-- `nanopilot/rl_collect.py`: flies a trained policy, buffers rows per
-  episode, drops crashed/flyaway episodes, writes standard tubs.
-- `nanopilot/gz_reset_worker.py` + `scripts/rl_train.sh`.
-
-Verified end-to-end (bounded smoke, 1280 steps + resume + collect): resets,
-episodes, PPO updates, checkpoint/vecnorm saving, resume continuation, and
-teacher tub writing all work. `models/rl/smoke/` is that junk-weight smoke
-artifact — safe to delete, or reuse for pipeline tests.
-
-Sharp edges found this session (all fixed, don't regress them):
-
-- gz-transport service requests from a torch-loaded process reliably time
-  out, and enough timed-out in-process requests wedge Gazebo's UserCommands
-  service for ALL callers until the stack restarts. Pose resets therefore go
-  through a `gz_reset_worker.py` subprocess (same pattern/reason as
-  `gz_camera_worker.py`). Never call gz services in-process from
-  training/eval code.
-- gz `set_pose` does NOT zero velocity: after a fast flyaway the drone keeps
-  its momentum through the teleport. `GateChaseEnv._teleport_to_spawn`
-  re-pins the pose and requires a displacement-based calm window before
-  starting the episode.
-- `SimTelemetry`/`PoseTracker` velocities are finite differences and spike
-  absurdly on teleports; both now clamp >20 m/s samples to zero. Before the
-  clamp, the altitude damper would slam throttle on every reset and bounce
-  the drone for many seconds.
-- `init_pose_subscriber()` (altitude damper) used to read only the GZ_WORLD
-  env var; when unset the damper silently subscribed to a dead topic and the
-  drone climbed at 50+ m/s at hover PWM. It now takes the world from
-  `DroneGymEnv.gz_world`; `rl_train.py`/`rl_collect.py` also export GZ_WORLD.
-- At neutral controls the drone does not sit on the ground — hover bias +
-  damper keep it wandering at 2-3m. RL episodes start from that hover;
-  eval-style "takeoff to 1.5m" passes trivially.
-- `DroneGymEnv.spawn_pose` (x, y, z, yaw) is now settable; `_do_reset`
-  teleports there instead of hardcoded origin. The broken never-run
-  `step()`/`reset()` methods were removed from `DroneGymEnv`; RL goes through
-  `GateChaseEnv` wrapping `run_threaded`.
-
-Next steps: superseded — see the 2026-08-23 handoff below. RL training is
-blocked on an airframe altitude problem; do not start from this section.
-
-## Current Handoff (2026-08-23)
-
-**STATE: everything is stopped. No training run is in progress. RL training
-is BLOCKED — see the BLOCKER section below and fix that first.**
-
-The teacher/student pipeline itself works end to end (resets, episodes, PPO
-updates, checkpointing, resume, tub writing all verified). What does not work
-is the flight: on `slalom_gates_80mm` the drone climbs out of the world at
-neutral stick, so every episode dies in ~2.5s and PPO has no gradient.
-
-Two full runs were attempted:
-
-- `models/rl/ppo_gates_v1` + `logs/rl_train_ppo_gates_v1_4axis.log`: 4-axis
-  policy, reached 64.5k steps over 3h15m. `ep_rew_mean` −24.1 -> −23.7 and
-  `ep_len_mean` 37 -> 38.9, i.e. FLAT. 1660/1660 episodes flyaway, 0/3 gates
-  ever. Checkpoints to 60k are kept for reference only — the action space has
-  since changed to 3, so they will NOT load in the current env.
-- `models/rl/ppo_gates_v2`: 3-axis policy, only minutes of runtime before the
-  blocker was identified. Junk, safe to delete.
-- `models/rl/reset_check`, `models/rl/smoke`: bounded smoke artifacts, junk.
-
-An earlier 400k attempt died at 30.7k steps from reset-worker starvation
-(fixed, see below); its log is `logs/rl_train_ppo_gates_v1_failed_attempt1.log`.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
+| tub | rows | course | kind |
 | --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
+| `data/tub_22_26-09-07` | 22,202 | `s_curve_gates_80mm` (flat) | expert rollouts, 40/40 kept, all 10/10 |
+| `data/tub_23_26-09-07` | 19,505 | `s_curve_gates_80mm` (flat) | DAgger round 1 |
+| `data/tub_24_26-09-07` | 22,230 | `s_curve_heights_80mm` | expert rollouts, 40/40 kept, all 10/10 |
+| `data/tub_25_26-09-08` | 18,563 | `s_curve_heights_80mm` | DAgger round 1 |
 
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
+Current models:
 
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
+| model | course | result |
 | --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
+| **`models/bc_dagger1_heights.pth`** | heights | **10.0/10 gates, 5/5, crossing height err 0.254m** |
+| `models/bc_dagger1_scurve.pth` | flat S-curve | 10.0/10 gates, 5/5 |
+| `models/bc_expert_heights_v1.pth` | heights | 5.6/10 — expert-only, freezes/crashes off-manifold |
+| `models/bc_expert_scurve_v1.pth` | flat S-curve | 3.4/10 — expert-only |
 
-### The wider camera did NOT fix gates. It changed the failure, not the count.
+Everything else in `data/` and `models/` is superseded and most of it will not
+even load:
 
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
+- `models/rl/ppo_gates_v1` .. `v5`, `v4_best`, `reset_check` — the retired RL
+  teachers. See the Historical Record.
+- Anything trained before 2026-09-01 is `pre_velocity` (no `vel_fc.0.weight`)
+  and `checkpoint_kind()` rejects it: `bc_rl_*`, `bc_v3/v4`, `tub_*`,
+  `hello_world_tub3`, `pilot`.
+- `tub_12` .. `tub_17` predate the velocity-setpoint interface; `tub_18` and
+  `tub_19` are 80-degree optics; `tub_20`/`tub_21` are the abandoned 3-gate
+  slalom layouts. `bc_expert_v1`, `bc_expert_fov140`, `bc_expert_turn_v1` and
+  `bc_vel_dagger1` are slalom/old-plant students, kept only for comparison.
 
-| | 80 deg | 140 deg |
+**Do not mix tubs across an interface, optics, plant or course change.** Each
+of those silently changes what a label means.
+
+## Historical Record (2026-08-07 -> 2026-09-06)
+
+Condensed 2026-09-08. Every session below is superseded by the
+velocity-setpoint interface and the scripted `GateExpert` (2026-09-06b) and by
+the courses that followed. Full text of each original handoff is in git
+history: `git log -p -- AGENTS.md`.
+
+Kept here: the arc, so settled decisions are not re-litigated, and every lesson
+that still binds.
+
+### The arc
+
+| date | what happened | why it no longer drives work |
 | --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
+| 08-07 | Landing-target BC on `landing_target_80mm`. Max pitch/roll 45 -> 20 deg. | Plant and interface have both changed twice since; those tubs and models are dead. |
+| 08-22 | RL teacher/student pipeline built: `rl_env.py`, `rl_train.py`, `rl_collect.py`, `gz_reset_worker.py`, `rl_train.sh`. Direct pixel RL rejected — sim is real-time-locked (~70k steps/hour at 20Hz) and pixel PPO needs millions of steps. | Pipeline still exists and `rl_collect.py --expert` is still used. The PPO teacher is not. |
+| 08-23 | **Altitude flyaway blocker**, and its fix (below). | Fixed. |
+| 08-23 eve | `DRONE_PITCH_THROTTLE_FEEDFORWARD` 8.0 -> 2.0. `ppo_gates_v3` (3-action) failed: 17/17 gate crossings missed on HEIGHT, because it had no altitude actuator. `ppo_gates_v4` (`--control-altitude --altitude-scale=0.09`) was the first teacher to pass gates. | Superseded by the scripted expert. |
+| 08-24 | v4 finished 400k. **The 340k checkpoint was better than the 400k final** (10/10 vs 3/10 episodes). Student distillation failed: 5/5 crashes, all into the floor. Also the trainer fix that **separated best-weight SAVING from the early-stop test** (`MIN_DELTA_REL`) — still live, and referenced later as "the 2026-08-24 fix". | Teacher superseded; the trainer fix is current. |
+| 08-31 | DAgger round 1 (no velocity input): survival 18.4 -> 36.5s but gates regressed 0.4 -> 0.2. Diagnosed a structural blocker — the teacher's obs included VELOCITY, the student's inputs did not, so the student was regressing a function of a variable it could not see. | Fixed 09-01. |
+| 09-01 | Velocity input added to the student, unconditionally (see "Velocity input" below). Partial win: altitude variance tightened and the gate regression reversed, but crashes stayed 5/5. | Still current. |
+| 09-05 | **Root cause of the crashes found**, and it was never an oscillation: a ~5 PWM (2.5% of full scale) DC thrust bias, integrated by a plant with no height regulation. `vz = B/K` predicted the observed sink to within 0.005 m/s in every episode. Invisible in val_loss; fatal in flight. | Fixed 09-05b. |
+| 09-05b | **PD altitude hold added** (`DRONE_ALTITUDE_HOLD_KP = 30.0`, `DRONE_ALTITUDE_TRIM_RANGE = 1.0`). A steady bias now produces a bounded offset instead of an unbounded sink. Both existing models went stale in the same stroke. | Still current. |
+| 09-06 | `ppo_gates_v5` on the PD plant: **zero height misses in 29 crossings** (v3 missed 17/17 on height), but much weaker laterally than v4 — 3/10 episodes 3/3 at 1.5x the steps. Takeoff capture height fixed via `set_altitude_setpoint`. | Teacher superseded 09-06b; the takeoff fix is still current. |
 
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
+The through-line: nearly every fix from August onward was classical control
+inserted between the network and the sticks (velocity damper, pitch
+feed-forward, PWM-space labels, DC high-pass, the PD hold). 2026-09-06b
+finished that job with a proper setpoint interface instead of continuing it one
+axis at a time.
 
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
+### The altitude flyaway, and its root cause (08-23)
 
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
+At neutral stick the 80mm drone climbed 0.34m -> 69.8m in 30s, so every RL
+episode died in ~2.5s and PPO had no gradient.
 
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-1. Fix the altitude blocker (below). Start with
-   `./scripts/test_thrust.sh --airframe=80mm`.
-2. Re-verify with `uv run --env-file .env python scripts/probe_hover.py`
-   against a running stack: a healthy airframe holds roughly constant z for
-   30s at neutral. Today it climbs 0.34m -> 69.8m.
-3. Only then restart the teacher:
-   `./scripts/rl_train.sh --total-steps=400000 --out=models/rl/ppo_gates_v3`.
-   Success looks like `Episode end:` shifting flyaway -> timeout -> completed
-   and `ep_rew_mean` climbing off −24.
-4. Then distill: `rl_collect.py --policy=models/rl/ppo_gates_v3 --episodes=20
-   --min-gates=2`, `torch_train.py` on the new tub, `eval_flight.sh` on
-   slalom_gates_80mm to compare student vs teacher.
-
-### Throughput reality
-
-The `~5.6h` rl_train.py prints counts flying time only and is wrong. Resets
-cost ~3s and early episodes last ~2s, so wall-clock is reset-dominated:
-measured ~5 env steps/sec early on (was 2.8 before this session's fixes).
-Throughput rises as episodes lengthen, approaching 20/sec (the control rate)
-if the policy learns to stay alive. Budget 10-20h for 400k, not 6h. Progress
-is never lost: checkpoints land in `<out>/checkpoints/` every 20k steps and
-`--resume=<out dir>` restores model + optimizer + VecNormalize.
-
-NOTE: on `--resume`, `--total-steps` means that many ADDITIONAL steps (SB3
-semantics), not a total budget.
-
-### Bugs fixed this session (do not regress)
-
-- **Velocity clamp blinded the altitude damper.** `gz_telemetry` used to zero
-  any velocity above 20 m/s to hide teleport spikes. The damper reads that
-  same value, so past 20 m/s it saw `vz=0`, applied no correction, and the
-  drone climbed to 50-100m unchecked. Velocities now SATURATE at
-  `MAX_VELOCITY` (never zero — a big reading must still produce a big
-  correction), and teleports call `reset_history()` on `SimTelemetry` /
-  `PoseTracker` to drop the stale sample instead.
-- **The damper only runs inside the altitude deadband** (`abs(alt) <
-  DRONE_ALTITUDE_HOLD_DEADBAND`, currently 0.1 for 80mm). Commanding any
-  altitude during a reset switches off the very thing that arrests the drone.
-  Reset loops must command altitude 0.0.
-- **Reset worker starvation.** Spawning one `uv run` process per reset (~2s
-  startup) meant a 1s re-request loop dropped 29% of requests behind a
-  "previous worker still running" guard; the drone drifted unpinned and the
-  400k run died at 30.7k steps. `gz_reset_worker.py --serve` is now a single
-  persistent process fed pose lines on stdin; requests are ~free.
-- **Reset "calm" criterion was stricter than physics.** The drone never goes
-  still — at neutral it hovers on the damper and bobs between 2-4m. Requiring
-  <0.3m drift over 0.5s made every reset run its full timeout; <1.0m (~2 m/s)
-  gives 3s resets.
-- **Neutral throttle does not lift the drone off the ground** (measured: 5s
-  at hover PWM, zero movement), so a landed reset needs a real climb command
-  to take off — see the ramped takeoff below.
-- **Altitude is no longer a policy axis.** `GateChaseEnv` is 3-action
-  (yaw/pitch/roll, obs 19 wide) and always commands altitude 0.0 so the
-  vertical damper stays engaged; `control_altitude=True` / `--control-altitude`
-  restores the 4th axis (obs 20, scaled by `--altitude-scale`). Reason: the
-  axis is direct motor throttle, any nonzero command disengages the damper,
-  and at 0.3 scale the policy had too little authority to arrest a climb it
-  could still start. `rl_collect.py` records `last_applied_action` (the
-  4-wide command actually flown), not the raw policy output.
-- **Takeoff must stop at liftoff, not at start_alt.** Throttle authority is
-  ~±100 PWM and the band between "won't leave the ground" (0.15) and "rockets
-  to 9m" (0.6) sits inside it. `_takeoff` now ramps from 0.2 by +0.01/50ms and
-  cuts the moment `vz > liftoff_vz`, then `_arrest_climb` holds neutral until
-  vertical motion is small and accepts whatever height the damper settles on
-  (`min_start_alt`). Powering all the way to `start_alt` made the drone cross
-  it at ~8 m/s and coast to 9m with the damper saturated.
-- BetaFlight sometimes fails to arm at stack start (`RX_FAILSAFE`,
-  `NOT_DISARMED`, `ARM_SWITCH`, or MSP query failures). A disarmed board can
-  never take off, so `reset()` now re-raises immediately when
-  `env.bf_armed` is false instead of burning 8 retries before the supervisor
-  rebuilds the stack.
-- **`rl_train.sh` is now a supervisor.** BetaFlight SITL randomly aborts at
-  launch AND randomly resets its MSP socket during the post-reboot config
-  step (`start.sh` retries the launch but not that config step). The script
-  retries up to `RL_MAX_ATTEMPTS` (40), rebuilding the stack and resuming
-  from checkpoint each time, so an unattended run survives it.
-- `<out>/env_config.json` records rate/altitude-scale/etc; `rl_collect.py`
-  reads it so the teacher is flown exactly as trained.
-
-### BLOCKER: the 80mm airframe does not hold altitude (2026-08-23)
-
-**RESOLVED later the same day — see the "Current Handoff (2026-08-23,
-altitude blocker resolved)" section at the bottom. Kept for the record.**
-
-RL training on `slalom_gates_80mm` cannot work until this is resolved. Every
-episode ends in vertical flyaway in ~2.5s no matter what the policy does, so
-reward is flat (`ep_rew_mean` −24.1 -> −23.7 over 64k steps, 1660/1660
-episodes flyaway, 0/3 gates ever).
-
-Reproduce with `uv run --env-file .env python scripts/probe_hover.py` against
-a running stack (ramps to liftoff, then holds neutral 30s logging pos/vel):
-
-    t= 0.0s z= 0.34  vz=1.51  thr_pwm=1553
-    t=10.7s z=26.38  vz=1.46  thr_pwm=1430
-    t=29.9s z=69.83  vz=3.00  thr_pwm=1349
-
-The drone climbs 0.34m -> 69.8m in 30s at neutral, while the damper holds
-throttle 35-175 PWM BELOW the 1475 hover bias the whole time. Note also that
-`DRONE_THROTTLE_RANGE=100` means the pilot band is only 1375-1575, so a pilot
-cannot command descent at all — only the damper's extra bias gets below 1375.
-
-This is NOT an RL bug and predates the RL work; it likely also explains the
-altitude sag/climb noted in earlier BC handoffs and the lateral-coast Z climb.
-
-Complicating it: `drone_config_80mm.py` says `DRONE_HOVER_THROTTLE = 1475` was
-"Calibrated at 79g AUW with test_thrust damper-sim", so either that
-calibration no longer holds (airframe mass/drag changed since — the model SDF
-and plugin drag were both edited in earlier sessions) or the climb comes from
-somewhere other than the hover bias. Note `DRONE_THROTTLE_SCALE = 0.2` also
-shapes the stick curve non-linearly and is easy to overlook.
-
-Do NOT jump to "hover throttle is simply too high" and start editing
-`drone_config_80mm.py`. A throttle sweep (damper disabled, hover_throttle
-varied 1475 -> 1200, teleport to 4m, measure drift) appeared to show the drone
-FALLING at 1475 — the opposite of the neutral-hold result. That sweep is
-itself suspect: every row reported z_end = 0.01, i.e. the drone was sitting on
-the ground rather than hovering, so the teleport-to-4m step probably never
-took and the numbers may mean nothing. Treat BOTH the sweep and any simple
-"hover is too high" story as unverified. What IS solid and repeatable is the
-neutral-hold climb above.
-
-Candidate causes, none ruled out:
-
-- `PoseTracker.get_vz()` / `SimTelemetry.velocity` reading the wrong entity on
-  `dynamic_pose/info` (the subscriber matches any name containing "betaloop").
-- BetaFlight airmode / throttle-mixer behaviour making thrust depend on
-  history rather than the commanded CH3 PWM.
-- The Gazebo plugin's thrust model interacting with tilt.
-
-Suggested next step: `./scripts/test_thrust.sh --airframe=80mm` (its hover and
-damper-sim modes exist for exactly this) to recalibrate
-`DRONE_HOVER_THROTTLE`/`DRONE_THROTTLE_RANGE` before any further RL runs.
-Raising `flyaway_z` is NOT a workaround: the drone would still leave the gates
-far below it.
-
-### Debugging notes
-
-- gz service calls from a torch-loaded process time out; always use a
-  subprocess (see `gz_camera_worker.py`, `gz_reset_worker.py`).
-- When resets misbehave, log pos AND vel together — position alone cannot
-  distinguish "teleport failed" from "teleport worked, drone flew away".
-  A signature of x/y pinned exactly on target while z runs away means the
-  teleport is fine and something is driving it vertically.
-
-## Current Handoff (2026-08-23, altitude blocker resolved)
-
-**The 80mm altitude flyaway is FIXED. RL training is unblocked.** Everything
-is stopped; no training run is in progress.
-
-### Root cause
-
-Not the hover bias. BetaFlight's stock pitch/roll rate PIDs (p=45-47,
-i=80-84, d=38-46, f=120-125) limit-cycle in SITL: at fixed CH3 with the drone
-level, the front/rear motor pairs slammed bang-bang between ~1086 and ~1906
-PWM (observed live via MSP_MOTOR, cmd 104). Attitude barely moves, but
-thrust ∝ ω², so the symmetric split rectifies into phantom collective
-thrust — measured +2 to +7.7 m/s² extra, nearly independent of CH3. The
-throttle stick and damper had almost no authority over net thrust; average
-thrust was set by the oscillation's duty cycle. Same ω² mechanism as the
-documented "yaw adds thrust" bug, but on the pitch axis and spontaneous at
-hover. It also explains the earlier BC-era altitude sag/climb, the
+**It was not the hover bias.** BetaFlight's stock pitch/roll rate PIDs
+(p=45-47, i=80-84, d=38-46, f=120-125) limit-cycle in SITL: at fixed CH3 with
+the drone level, the front/rear motor pairs slammed bang-bang between ~1086 and
+~1906 PWM (seen live via MSP_MOTOR, cmd 104). Attitude barely moves, but
+thrust is proportional to w^2, so the symmetric split rectifies into phantom
+collective thrust — measured +2 to +7.7 m/s^2, nearly independent of CH3. The
+throttle stick and damper had almost no authority over net thrust. Same w^2
+mechanism as the documented "yaw adds thrust" bug, but on the pitch axis and
+spontaneous at hover. It also explains the BC-era altitude sag/climb, the
 lateral-coast Z climb, and why hover "calibration" never reproduced.
 
-### Fixes (all in the working tree)
-
-- `scripts/start.sh`: pitch/roll PIDs lowered to p=20 i=10 d=0 f=20 (both
-  axes, both airframes) via the CLI phase — `PID_GAINS` extends the old
-  `YAW_PID` mechanism. With the tame gains the motor split collapses to
-  ~30 PWM and thrust is a clean function of CH3 again.
-- `scripts/start.sh` CLI phase hardened. Two silent-failure bugs meant a
-  fresh eeprom could fly on stock PIDs + LEGACY mixer while the log claimed
-  success: (1) after the airmode-disable in-process MSP_REBOOT, this SITL
-  build's CLI goes permanently deaf — '#' never returns a prompt and every
-  get/set no-ops; (2) nothing verified the sets. Now: airmode disable
-  restarts via the exit-42 path instead of MSP_REBOOT (config loop is 3
-  passes: airmode → CLI → clean MSP-only), CLI entry retries until a prompt
-  actually appears, and a post-apply `get p_pitch` probe aborts the launch
-  if the sets didn't stick.
-- `nanopilot/drone_config_80mm.py`: `DRONE_HOVER_THROTTLE` 1475 → 1480
-  (static hover re-measured at ≈1478 — the old value was essentially right;
-  the oscillation was the climb). `DRONE_ALTITUDE_HOLD_K` 45 → 90: thrust
-  slope near hover is only ~0.01 m/s² per PWM, so K=45 gave ~0.45/s of
-  closed-loop damping, too soft against residual thrust scatter (~±0.5 m/s²
-  from small I-term motor splits during activity).
-
-### Verification
-
-`probe_hover.py` on `slalom_gates_80mm`, from a WIPED `eeprom.bin` and fully
-fresh stack: z 0.5 → 2.1m over 30s at neutral, vz +0.02-0.03 m/s, throttle
-steady 1477-1479. Reproduced twice (also on a carried-over eeprom).
-Before the fix: z 0.34 → 69.8m in 30s.
-
-Measurement gotchas discovered (worth keeping):
-
-- The sim has NO vertical drag: open-loop climb *rate* at a PWM is
-  meaningless (it just preserves entry momentum). Measure vertical
-  *acceleration* (quadratic fit of z(t)), or close the loop.
-- `test_thrust.py --mode=hover` sweeps from the ground; ground contact
-  masks the true hover point (that is how 1475 was "confirmed" wrong-ish).
-  Measure hover airborne.
-- Active PID activity adds rectified thrust even with tame gains, so a
-  PI-on-vz "hover finder" reads ~40-60 PWM low while it is actively
-  stabilizing. Trust ballistic holds entered at ~zero vz, cross-checked
-  against static thrust math (km=1.9e-7, maxRpm=2094, mass 0.079kg →
-  hover ≈ motor 1482).
-- BetaFlight refuses CLI while armed, and a CLI socket needs ~0.3s after
-  connect before sending '#', or it never answers.
-
-### Follow-ups
-
-1. Flight dynamics changed (rate loops much softer, d=0). Pre-existing
-   models (tub_12 etc.) and old eval numbers are NOT comparable to the new
-   tune. Re-validate `DRONE_PITCH_THROTTLE_FEEDFORWARD` and the damper-sim
-   check (`test_thrust.sh` damper mode) before further BC work.
-2. 65mm inherits the same pitch/roll gains from start.sh but was not
-   re-tested airborne.
-3. RL: resume from the morning handoff's step 3:
-   `./scripts/rl_train.sh --total-steps=400000 --out=models/rl/ppo_gates_v3`.
-   Old checkpoints (`ppo_gates_v1/v2`) trained against the oscillating plant
-   are junk for the new dynamics.
-
-NOTE: items 1 and 3 are DONE — see the newest handoff at the bottom. The
-pitch feed-forward was retuned (8.0 -> 2.0) and `ppo_gates_v3` ran to 280k
-and was superseded by `ppo_gates_v4`. Item 2 (65mm) is still open.
-
-## Current Handoff (2026-08-23 evening, RL teacher learning to fly gates)
-
-**STATE: `models/rl/ppo_gates_v4` is TRAINING RIGHT NOW** as a detached
-process (see "Checking on the run"). It is the first teacher that actually
-passes gates. Do not start a new RL run without checking whether this one is
-still alive or has finished.
-
-### What changed since the altitude-blocker handoff above
-
-Three separate problems were fixed in sequence. Each one masked the next, so
-the order matters if you are reading this to understand why the configs look
-the way they do:
-
-1. **BF pitch/roll PIDs limit-cycling** (fixed earlier today, see the section
-   above): phantom collective thrust, drone left the world at neutral stick.
-2. **Pitch throttle feed-forward too large**: `DRONE_PITCH_THROTTLE_FEEDFORWARD`
-   8.0 -> 2.0. A velocity-only damper cancels a constant thrust bias only at a
-   nonzero climb rate (`vz_steady = ff*pitch/K`), so a large ff made any
-   sustained pitch climb. At ff=8 the drone gained ~4m per 60s of half-pitch
-   flight. Swept 0/2/4/6/8 airborne with the damper engaged
-   (`scripts/ff_sweep.py`); ff=2 minimizes |drift| and, unlike higher values,
-   is not systematically upward (+2.0m/60s at half pitch, -0.9m at full).
-   Also tested hover 1477 vs 1480 — 1480 is better, left alone.
-3. **The RL policy had no altitude axis at all.** This was the real reason
-   `ppo_gates_v3` could never pass gates (below).
-
-### Why v3 failed, and how that was diagnosed
-
-`models/rl/ppo_gates_v3` (3-action, no altitude axis) ran to 280k steps. It
-looked healthy — `ep_rew_mean` climbed -71 -> -14, flyaways went to ~0,
-nearly every episode ended `completed` — but the gate-pass rate plateaued at
-~15% of episodes passing >=1 gate, **0% ever passing >=2**, and 0 completions
-of 3/3 in 972 episodes.
-
-`ep_rew_mean` was a misleading health metric here: "completed" only means the
-drone crossed the plane of every gate, whether or not it went *through* the
-opening (a miss still advances the gate index, costing -3 vs +10 for a pass).
-So a policy that flies the course fast and misses every gate scores well.
-**Track the `gates X/3` distribution, not reward.**
-
-A diagnostic rollout (`scripts/gate_rollout.py`, now in the repo) settled it:
-17 gate-plane crossings, 0 passes, and **all 17 missed on HEIGHT** — crossing
-at 3.07-9.99m (mean 4.77m) when gates sit at z=1.5 with a 0.2-3.0m pass band.
-Lateral aim was fine (median offset 1.55m against a 0.9m half-width). The
-drone was flying over the gates and, with no altitude axis, had no actuator
-to fix it: it starts near 1.4m and drifts above the 3.0m ceiling within ~25s,
-after which every remaining gate is unreachable by construction.
-
-The reward shaping was never the problem. Do not "fix" gate misses by raising
-`pass_bonus` without first checking crossing geometry with `gate_rollout.py`.
-
-### v4: what is running now
-
-    ./scripts/rl_train.sh --total-steps=400000 --out=models/rl/ppo_gates_v4 \
-        --control-altitude --altitude-scale=0.09
-
-`--altitude-scale=0.09` is the load-bearing detail. `DRONE_THROTTLE_SCALE=0.2`
-makes the throttle curve very steep near zero, so 0.09 keeps every policy
-command inside the 0.1 damper deadband while still giving ~±62 PWM (~±1 m/s²)
-of trim authority. The policy gets real altitude control AND the vertical
-damper stays engaged as a safety net. The earlier abandoned attempt used
-scale 0.3, where any meaningful command *disengages* the damper — an
-all-or-nothing actuator, which is why it was judged unlearnable.
-
-Verify the axis is live by grepping commanded altitude in the log: v4 shows
-`alt=` values spread over ±0.09; v3 showed only `alt=0.00` (the 0.20-0.23
-values in both logs are the scripted takeoff ramp, not the policy).
-
-Results so far (v4 vs v3 at comparable points):
-
-| metric | v3 @280k, 972 eps | v4 @~105k, 237 eps |
-| --- | --- | --- |
-| episodes passing >=1 gate | 15% | 75-80% |
-| episodes passing >=2 gates | 0% | 17-20% |
-| episodes passing 3/3 | 0 | 0 |
-| `ep_rew_mean` | -14 | ~0 (briefly +2.8) |
-
-At ~178k steps: gates 0/1/2/3 = 186/159/68/0 cumulative. 2-gate episodes end
-`completed` after ~400 steps, i.e. the drone flies the whole course and misses
-exactly one gate — a precision problem, not a capability one.
-
-On the zero 3/3: the gate-count distribution matches near-independent per-gate
-passing (p~0.32-0.34), which predicts 3/3 at only ~3-4%. There is no evidence
-of a structural barrier at the third gate; it should appear on its own as p
-rises (at p=0.45 it would be ~9%). Do not panic-tune because 3/3 is 0.
-
-### Checking on the run
-
-    pgrep -fl rl_train.sh                      # is it alive?
-    tail -f logs/rl_train_ppo_gates_v4.log
-    for g in 0 1 2 3; do \
-      echo "gates $g/3: $(grep -c "gates $g/3" logs/rl_train_ppo_gates_v4.log)"; done
-
-Windowed pass rate (the metric that matters):
-
-    python3 - <<'PY'
-    import re
-    eps=[int(m.group(1)) for l in open('logs/rl_train_ppo_gates_v4.log',errors='replace')
-         if (m:=re.search(r'Episode end: \w+, gates (\d)/3',l))]
-    for lbl,w in (("last 100",eps[-100:]),("last 50",eps[-50:])):
-        print(f"{lbl}: >=1 {sum(1 for g in w if g>=1)/len(w)*100:.0f}%  "
-              f">=2 {sum(1 for g in w if g>=2)/len(w)*100:.0f}%  3/3={sum(1 for g in w if g==3)}")
-    PY
-
-### SHARP EDGE: a killed run silently restarts from scratch
-
-`rl_train.py --resume` loads only `<out_dir>/model.zip`, and that file is
-written **when `model.learn()` returns** (clean finish or KeyboardInterrupt).
-A run killed by a signal leaves only `<out_dir>/checkpoints/`, and
-`rl_train.sh` resumes only `if [ -f "$OUT_DIR/model.zip" ]` — so relaunching
-after a hard kill **starts from step 0 with no warning and discards
-everything**. This bit this session (the v4 background task was killed at
-~178k; the process died by signal with no traceback).
-
-Recovery, before relaunching:
-
-    cp models/rl/ppo_gates_v4/checkpoints/ppo_gates_<N>_steps.zip \
-       models/rl/ppo_gates_v4/model.zip
-    cp models/rl/ppo_gates_v4/checkpoints/ppo_gates_vecnormalize_<N>_steps.pkl \
-       models/rl/ppo_gates_v4/vecnorm.pkl
-
-Then confirm the log says `Resuming from models/rl/ppo_gates_v4`. Remember
-`--total-steps` on resume means ADDITIONAL steps (SB3 semantics), and you must
-pass `--control-altitude --altitude-scale=0.09` again — they define the action
-space the checkpoint expects, and `env_config.json` does not exist until the
-run finishes.
-
-Worth fixing properly: `rl_train.sh` should fall back to the newest checkpoint
-in `checkpoints/`, or refuse to start, instead of quietly starting over.
-
-**Launching so it survives:** macOS has no `setsid(1)`, and a plain background
-launch dies with its process group. `scripts/detach_launch.py` forks, calls
-`os.setsid()`, redirects stdio to the log and execs the supervisor:
-
-    python3 scripts/detach_launch.py    # edit CMD/LOG at the top first
-
-### Next steps
-
-1. Let v4 finish (400k total; it resumed from 160k with 240k additional).
-   Watch the windowed >=2 rate — that is what gates distillation.
-2. Distill. NOTE `--min-gates=3` (the older handoff's suggestion) would
-   currently yield ZERO episodes. Use 2:
-
-       GZ_HEADLESS=1 GZ_WORLD=slalom_gates_80mm ./scripts/start.sh \
-           --no-manage --airframe=80mm
-       uv run --env-file .env python nanopilot/rl_collect.py \
-           --policy=models/rl/ppo_gates_v4 --episodes=40 --min-gates=2
-
-   At ~20% yield, 40 episodes gives ~8 clean tubs; scale episodes to taste.
-3. `torch_train.py` on the new tub, then `eval_flight.sh` on
-   `slalom_gates_80mm` to compare student vs teacher.
-4. Still open from the earlier handoff: the 65mm airframe inherits the new
-   pitch/roll PID gains from `start.sh` but has not been re-tested airborne.
-5. Old artifacts: `ppo_gates_v1/v2` (oscillating-plant era) and
-   `ppo_gates_v3` (no altitude axis) are both superseded. v3's checkpoints
-   will NOT load in the 4-action env.
-
-### New diagnostic scripts (added to the repo this session)
-
-| Path | Purpose |
-| --- | --- |
-| `scripts/gate_rollout.py` | flies a trained policy, reports per-crossing lateral offset / height / speed vs the pass window; splits misses into lateral vs height causes |
-| `scripts/ff_sweep.py` | sweeps `DRONE_PITCH_THROTTLE_FEEDFORWARD` airborne with the damper engaged, reporting climb rate per pitch |
-| `scripts/detach_launch.py` | `os.setsid()` launcher so long runs survive process-group kills |
-
-Both flight scripts need a running stack and take a few minutes each.
-
-## Current Handoff (2026-08-24, teacher DONE, student distillation FAILS)
-
-**STATE: everything is stopped. No run in progress.** The RL teacher is
-finished and good. The BC student distilled from it does NOT fly. Offline the
-student clones the teacher well; closed-loop it crashes within ~13s.
-
-### The teacher is done and it works
-
-`models/rl/ppo_gates_v4` finished 400,640 steps cleanly (log
-`logs/rl_train_ppo_gates_v4.log`). Final training window: 100% of episodes
-passed >=1 gate, ~96% >=2, ~69% 3/3, 149/150 `completed`.
-
-**The 400k final model.zip is NOT the best checkpoint.** Performance peaked
-around 320-340k and decayed after. Deterministic `gate_rollout.py`, 10
-episodes each:
-
-| teacher | 3/3 episodes | gates | misses |
-| --- | --- | --- | --- |
-| 340k checkpoint | 10/10 | 30/30 | 0 |
-| 400k final | 3/10 | 23/30 | 7, ALL lateral |
-
-Per-20k-step training rate confirms the arc: 3/3 was 69/81/78/61/56% at
-300/320/340/360/380k. Use **`models/rl/ppo_gates_v4_best/`** (the 340k
-checkpoint staged as model.zip + vecnorm.pkl + env_config.json, with
-PROVENANCE.txt). `models/rl/ppo_gates_v4/` keeps the full run + checkpoints.
-
-Lesson: pick the teacher by deterministic rollout, not by final step count.
-
-### The student does not fly
-
-- `data/tub_15_26-08-24`: 7181 frames, 24 kept / 16 dropped episodes,
-  `rl_collect.py --min-gates=3` off the 340k teacher. Every kept episode is a
-  clean 3/3 run. 95MB.
-- `models/bc_rl_v4best.pth`: trained on that tub alone, best val (Huber)
-  0.013433 at epoch 4, early-stopped at 9.
-
-Offline the student is a GOOD clone (900 records, correct 120x160 resolution):
-
-| axis | corr | MAE | pred std | label std |
-| --- | --- | --- | --- | --- |
-| yaw | 0.89 | 0.074 | 0.202 | 0.228 |
-| pitch | 0.90 | 0.115 | 0.399 | 0.437 |
-| roll | 0.97 | 0.144 | 0.613 | 0.686 |
-| **altitude** | **0.25** | 0.014 | **0.0069** | **0.0200** |
-
-Closed-loop `eval_flight.sh` on slalom_gates_80mm, 5 runs x 60s:
-
-| rate | crash rate | mean survival | mean gates |
-| --- | --- | --- | --- |
-| 30Hz (eval default) | 5/5 | 9.65s | 0.4 |
-| 20Hz (teacher's rate) | 5/5 | 13.38s | 0.6 |
-
-### Diagnosis: the altitude axis is not learned, and it is what kills it
-
-Every failed episode is a FLOOR crash, not a tilt crash: `alt_min` is
-0.10-0.12 in all 10 episodes against `--crash-z 0.12`. Altitude oscillates
-hugely (`alt_std` 0.68-0.91m, ranging 0.10 -> 2.3-3.9m) where the teacher held
-z=1.1-1.9m through every gate.
-
-Cause is visible in the offline table: teacher altitude labels have std 0.020
-while the other axes are 0.23-0.69. With uniform `TRAIN_LOSS_WEIGHTS`, the
-altitude axis contributes ~nothing to the Huber loss, so the model predicts a
-near-constant -0.004 (pred std 0.0069, barely a third of the label std, corr
-0.25). The student therefore loses the teacher's active vertical trimming and
-develops a divergent vertical oscillation into the floor.
-
-`torch_train.py` lines 240-245 already warn about this axis, but the comment
-argues AGAINST up-weighting it. That reasoning holds for human-piloted tubs
-where altitude really is ~0; it does NOT hold for RL-teacher tubs, where the
-small altitude values are real, load-bearing trim.
-
-### Both altitude fixes were tried. Axis is FIXED; flight still fails.
-
-Eval rate note first: `eval_flight.py --rate-hz` defaults to **30** but the
-teacher and tubs are **20**. Always pass `--rate-hz=20` for RL-distilled
-students. All rows below are 20Hz, 5 runs x 60s, slalom_gates_80mm.
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| uniform weights, model altitude | 5/5 | 13.4s | 0.6 | 1.48-2.47 | 0.68-0.91 |
-| uniform weights, `--zero-altitude` | **0/5** | 60.0s | 0.4 | 3.06-3.46 | 0.36-0.47 |
-| `TRAIN_LOSS_WEIGHTS=[1,1,1,25]` | 5/5 | 11.0s | 0.4 | **1.02-1.51** | 0.59-0.82 |
-
-**Experiment 1 (`--zero-altitude`, new flag on eval_flight.py) confirmed the
-diagnosis and killed the simple fix at the same time.** Zeroing axis 4 stops
-every crash (5/5 -> 0/5, survives the full 60s), so the axis WAS the crash
-cause. But the damper alone settles at 3.06-3.46m while gates sit at z=1.5
-with a 0.2-3.0m pass band, so the drone cruises above the pass ceiling and
-gates stay unreachable. The damper is a survival net, not a height controller.
-Do not "fix" this by commanding altitude 0.0.
-
-**Experiment 2 (up-weighting) worked as designed and was still not enough.**
-`TRAIN_LOSS_WEIGHTS = [1.0, 1.0, 1.0, 25.0]` is now set in
-`drone_config_80mm.py`. Offline on tub_15, altitude corr **0.25 -> 0.76** and
-pred std **0.0069 -> 0.0151** (label 0.0200), and the other axes did NOT
-suffer (yaw 0.89->0.90, pitch 0.90->0.91, roll 0.97->0.98) — so the warning in
-`torch_train.py` about starving the visual axes does not apply at this weight.
-Model: `models/bc_rl_v4best_w25.pth` (best val 0.012331; note the loss function
-changed, so that number is NOT comparable to the uniform run's 0.013433).
-
-In flight the axis now aims at the RIGHT HEIGHT — alt_mean 1.02-1.51m against
-the teacher's 1.1-1.9m, versus 3.2m when zeroed — but altitude variance barely
-moved (std 0.59-0.82) and every episode still oscillates down into the floor
-(alt_min 0.10-0.12 vs `--crash-z 0.12`). Mean is right, control is not.
-
-### Probe result: altitude was a REPRESENTATION bug, now fixed
-
-The "smooth the altitude command" probe was run and **disproved**: the
-student's command was already smoother than the teacher's (cmd_std
-0.006-0.014 vs teacher 0.020, step-to-step |delta| ~0.002). It was not
-oscillating -- it carried a small persistent NEGATIVE bias.
-
-That bias mattered enormously because `DroneGymEnv._rc_channels` maps altitude
-to throttle as `sign(a)*|a|**DRONE_THROTTLE_SCALE` with scale **0.2** — a curve
-that is nearly vertical at zero:
-
-    alt=-0.0001 -> -15.8 PWM      alt=-0.0028 -> -30.9 PWM  (teacher mean)
-    alt=-0.0104 -> -40.1 PWM      alt=-0.0900 -> -61.8 PWM  (student mean)
-
-So raw altitude labels look like a degenerate spike (std 0.020) while the
-thrust they encode spans **std 39.8 PWM**. A 0.0076 raw-space error is ~1e-5 of
-Huber loss — invisible even at weight 25 — but **9.3 PWM of sustained downward
-thrust**, which is what flew the student into the floor. The axis was badly
-CONDITIONED, not merely under-weighted.
-
-Fix: `TRAIN_ALTITUDE_PWM_SPACE = True` in `drone_config_80mm.py` trains the
-altitude target in PWM space (`TubDataset(altitude_pwm_scale=...)` pre-applies
-the curve; `TorchPilot(altitude_pwm_scale=...)` applies the inverse at
-inference; `torch_train.py` records it in `arch_meta`). Transformed labels have
-std **0.397**, comparable to pitch 0.449 — so `TRAIN_LOSS_WEIGHTS` went back to
-uniform `[1,1,1,1]`.
-
-**The flag must match between training and inference or the altitude axis is
-silently wrong, with no error** — same failure class as the 120x160 resolution
-gotcha. `eval_flight.py` and `drone_manage.py` both read it from config.
-
-Results (`models/bc_rl_v4best_pwm.pth`, best val 0.009384, trained 28 epochs vs
-9-11 before — the loss finally has gradient on that axis):
-
-| metric | alt x25 raw | PWM space |
-| --- | --- | --- |
-| altitude thrust error | 18.63 PWM | **4.89 PWM** |
-| altitude corr | 0.76 | **0.86** |
-| yaw / pitch / roll corr | 0.90 / 0.91 / 0.98 | **0.97 / 0.98 / 0.99** |
-| mean survival | 11.0s | **18.4s** |
-| crash rate | 5/5 | 5/5 |
-| gates | 0.4 | 0.4 |
-
-Note the other three axes improved too, because altitude no longer needs a
-distorting 25x weight. Commanded altitude now matches the teacher's
-distribution (cmd_mean -0.0047 vs teacher -0.0028, cmd_std ~0.017 vs 0.020).
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-The representation bug AND the axis-weight bug are both now ruled out. Offline
-fidelity is excellent (0.97/0.98/0.99/0.86) and the commands match the
-teacher's distribution, yet the drone still oscillates vertically (alt_std
-0.57-0.81, unchanged from before the fix) and clips the floor at 0.12m. Note
-the damper alone gives alt_std 0.36-0.47, so commanding the axis at all makes
-the oscillation WORSE — this is a closed-loop interaction, not a fit problem.
-
-That is genuine compounding error, and DAgger is the indicated fix.
-
-## Current Handoff (2026-08-31, DAgger round 1 + the real structural blocker)
-
-**STATE: everything stopped, nothing running.** DAgger round 1 is built, run,
-trained, and evaluated. It doubled survival but regressed gate passing, and
-the investigation turned up a STRUCTURAL reason the student cannot clone this
-teacher. Read that section before doing another round.
-
-### DAgger round 1
-
-`nanopilot/dagger_collect.py` (new): flies the STUDENT so the visited states
-are its own, and records the TEACHER's action at each state as the label. Cheap
-here because the teacher is state-based and can label any state on demand.
-Crashed episodes are KEPT by default (the pre-crash states are the corrective
-data — dropping them defeats the purpose). `--beta` mixes in teacher-driven
-steps if the student crashes too fast to gather useful states.
-
-Verified the labels really are teacher corrections, not student echo: on
-tub_16, label vs student output correlate only 0.41-0.65 with mean|diff| up to
-0.72 on roll (label -0.17 vs student +0.55).
-
-Data: `data/tub_16_26-08-24` (613 rows, smoke) + `data/tub_17_26-08-24`
-(5643 rows, 30 episodes). Trained `models/bc_rl_dagger1.pth` on
-tub_15+16+17 (13,437 frames), best val 0.035903. That val is NOT comparable to
-the 0.009384 of the pure-teacher model: DAgger data is deliberately harder
-off-distribution states.
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC uniform | 5/5 | 13.4s | 0.6 | 1.48-2.47 | 0.68-0.91 |
-| BC zero-alt | 0/5 | 60.0s | 0.4 | 3.06-3.46 | 0.36-0.47 |
-| BC alt x25 | 5/5 | 11.0s | 0.4 | 1.02-1.51 | 0.59-0.82 |
-| BC PWM space | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| **DAgger round 1** | 5/5 | **36.5s** | **0.2** | **1.22-1.43** | 0.52-0.98 |
-
-Survival doubled (18.4 -> 36.5s, best of any config that commands altitude) and
-altitude centering is the tightest yet (1.22-1.43 vs teacher 1.1-1.9). But
-gates REGRESSED to 0.2, and all 5 episodes still end on the floor
-(alt_min 0.12 every time). It learned to survive at the cost of gate-seeking.
-
-### THE STRUCTURAL BLOCKER: the student cannot observe what the teacher acts on
-
-`GateChaseEnv` observation `[5:8]` is **velocity** in the drone-heading frame.
-The teacher's altitude control is therefore VELOCITY FEEDBACK. The student's
-inputs are one camera frame plus a 3x6 IMU history (accel + gyro) — **no
-velocity, and no image history**. Vertical velocity is not recoverable from
-three accelerometer samples.
-
-So the student is being asked to regress a function of a variable it cannot
-see. That is why the vertical oscillation is immune to every data-side fix
-tried so far: loss weights (x25), the PWM-space representation, and DAgger all
-improved label fidelity without touching observability. Note the damper alone
-gives alt_std 0.36-0.47 while every model-commanded config sits at 0.52-0.98.
-
-**The data is already there.** `DRONE_TUB_INPUTS` has recorded
-`vel/vel_x,y,z` in every tub including all three current ones (verified:
-tub_17 row 0 has vel_z=0.837). `LinearModel.forward(img, imu)` simply never
-consumes it, and `TorchPilot.run()` has no parameter for it.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-1. **Feed velocity to the student.** Extend `LinearModel.forward` to take a
-   velocity vector, `TubDataset` to return it (already in the tubs),
-   `TorchPilot.run` to accept it, and the callers (`eval_flight.py`,
-   `drone_manage.py`, `dagger_collect.py`) to pass `outputs[VEL]`. This is an
-   architecture change: existing 4-output checkpoints will NOT load. Gate it
-   behind a config flag the way `TRAIN_ALTITUDE_PWM_SPACE` is, and record it in
-   `arch_meta`.
-   Caveat worth deciding deliberately: on real hardware vz needs a barometer or
-   optical-flow estimate. Fine for a sim course; a real-airframe port would
-   need an estimator.
-2. Only then consider DAgger round 2. Another round without fixing
-   observability will keep trading gate accuracy for survival.
-3. If velocity input is rejected, the alternative is to give the teacher the
-   student's observation space (retrain the RL teacher WITHOUT velocity in its
-   obs) so the target policy is actually representable by the student. That is
-   a full teacher retrain (~4h) but it makes distillation well-posed.
-
-### Also fixed this session
-
-`stop_all.sh`'s new wrapper kill used `pgrep -f "scripts/start\.sh"`, which
-matches any process whose command line merely MENTIONS that path. A training
-command that grepped for stack processes matched it and was killed mid-launch
-(no log, exit 1, ~30 min lost). The pattern is now ANCHORED to a shell actually
-executing the script:
-`pgrep -f '^[^ ]*/?bash[^ ]* [^ ]*scripts/start\.sh'`. Verified three ways:
-a real wrapper is still reaped, a command merely mentioning the path is not,
-and the exact failing command shape now runs to completion.
-
-1. **DAgger is now the indicated fix**, and it is unusually cheap here: the
-   teacher is state-based, so it can label ANY state the student visits.
-   Fly the student, capture frames, query
-   `models/rl/ppo_gates_v4_best` for the action at each visited privileged
-   state, and append those corrected rows to the tub. That directly attacks
-   the compounding error rather than the label distribution.
-2. Cheaper thing worth trying first: smooth/rate-limit the altitude command at
-   runtime, or feed the model its own previous altitude command. The failure
-   is an oscillation, and the current model is memoryless on that axis.
-3. Do NOT re-tune `TRAIN_LOSS_WEIGHTS` further. Altitude corr 0.76 with the
-   right cruise height means the label fit is no longer the bottleneck.
-
-### Fixed / added this session
-
-- `scripts/gate_rollout.py` could not load any 4-action policy: it hardcoded
-  `control_altitude=False`, so v4 (obs 20) died in `VecNormalize.load` with
-  `spaces must have the same shape: (20,) != (19,)`. It now resolves
-  `env_config.json` from `--policy` OR its parent (so pointing at
-  `checkpoints/` works) and takes `--control-altitude` / `--altitude-scale`
-  overrides. It prints what it resolved.
-- `scripts/promote_checkpoint.py` (new): watches `<out>/checkpoints/` and
-  atomically promotes the newest checkpoint pair to `model.zip`/`vecnorm.pkl`,
-  capping the loss from a signal-killed run at one checkpoint interval. Exits
-  when the supervisor pid dies so it can never clobber a clean final save.
-  Used for the whole back half of the v4 run.
-
-### Still open
-
-- 65mm airframe still not re-tested airborne on the new pitch/roll PID gains.
-
-### Resume footgun and wrapper leak: BOTH FIXED (2026-08-24)
-
-`rl_train.sh` no longer silently restarts from step 0. Before choosing a
-resume it runs `promote_checkpoint.py --once`, so a run killed by a signal
-(progress only in `checkpoints/`) is promoted and resumed. If checkpoints
-exist but none can be promoted, it now **refuses with exit 2** rather than
-discarding them. A clean final `model.zip` is never clobbered, because
-promotion skips any checkpoint older than `model.zip`.
-
-Verified against four synthetic out-dirs, using the shipped lines extracted
-from the script itself:
-
-| case | behavior |
-| --- | --- |
-| fresh (no checkpoints) | starts at step 0 |
-| killed (stale model.zip @20k, checkpoints @40k) | promotes 40k, resumes |
-| unpromotable (zip, no vecnormalize pkl) | refuses, exit 2 |
-| clean finish (model.zip newer than checkpoints) | keeps final, resumes |
-
-`stop_all.sh` now also kills the `start.sh` wrapper, killing its
-`tail -f /dev/null` keepalive child FIRST (otherwise the child is orphaned and
-survives its parent anyway). It walks the ancestor pid chain and skips any
-`start.sh` that is calling it — the real `start.sh` runs `stop_all.sh` from its
-own EXIT trap (`start.sh:88`), so without that guard it would kill itself
-mid-cleanup. Verified three ways: an orphaned wrapper is reaped, a wrapper that
-invokes `stop_all.sh` itself survives, and a real `--no-manage` stack tears
-down to zero wrappers/tails/gz/betaflight/camera-workers.
-
-### Measurement gotcha (cost real time this session)
-
-`TorchPilot`/`LinearModel` must be built at **TRAIN_IMAGE_H/W (120x160)**, not
-the camera's 640x480. `AdaptiveAvgPool` means a 640x480 model loads the same
-state_dict without error and silently returns badly biased predictions
-(roll pred mean -0.92 vs label -0.20). `eval_flight.py` and `drone_manage.py`
-both get this right via `getattr(cfg,'TRAIN_IMAGE_H',...)`; ad-hoc probes do
-not. If an offline check disagrees wildly with the reported val_loss, suspect
-the resolution before suspecting the model.
-
-
-## Current Handoff (2026-09-01, velocity input added; partial win)
-
-**STATE: stopped, nothing running.** The student now takes a velocity input.
-It helped, but it did NOT fix the crashes. Also fixed a significant
-pre-existing train/inference image bug found while verifying the change.
-
-### Velocity input (no config flag — unconditional)
-
-`LinearModel.forward(img, imu, vel)` now takes heading-frame velocity through a
-small MLP branch. Wired end to end:
-
-| file | change |
-| --- | --- |
-| `tub_schema.py` | `heading_frame_velocity()` + `VELOCITY_SCALE`, imported by BOTH dataset and pilot so the transform cannot drift |
-| `torch_model.py` | `vel_dim=3`, `vel_fc` branch, `forward(img, imu, vel)` |
-| `dataset.py` | returns `(image, imu, vel, target)`; velocity was already in every tub |
-| `torch_pilot.py` | `run(..., vel_x, vel_y, vel_z, yaw_deg)`, rotates internally |
-| `torch_train.py` | 4-tuple unpack, `vel_dim` in `arch_meta` |
-| `evaluate.py` | 4-tuple unpack; legacy models still take `(img, imu)` |
-| `eval_flight.py`, `dagger_collect.py` | pass `outputs[VEL]` + `att[2]` |
-| `drone_manage.py` | `inputs += IMU_KEYS + VELOCITY_KEYS + ["imu/yaw"]`, and REFUSES to start if `DRONE_RECORD_VELOCITY`/`ATTITUDE` are off |
-
-Velocity is rotated into the DRONE-HEADING frame and scaled by 5, matching
-`GateChaseEnv._get_obs()[5:8]` exactly, so the student sees the axis in the
-units the teacher acted on. Verified yaw-invariant.
+Fixes, all still in the tree:
+
+- `scripts/start.sh`: pitch/roll PIDs lowered to **p=20 i=10 d=0 f=20** (both
+  axes, both airframes) via the CLI phase; `PID_GAINS` extends the old
+  `YAW_PID` mechanism. The motor split collapses to ~30 PWM and thrust becomes
+  a clean function of CH3 again.
+- `scripts/start.sh` CLI phase hardened. Two silent-failure bugs meant a fresh
+  eeprom could fly on stock PIDs + LEGACY mixer while the log claimed success:
+  (1) after an in-process MSP_REBOOT this SITL build's CLI goes permanently
+  deaf — '#' never returns a prompt and every get/set no-ops; (2) nothing
+  verified the sets. Now airmode disable restarts via the exit-42 path, CLI
+  entry retries until a prompt actually appears, and a post-apply `get p_pitch`
+  probe aborts the launch if the sets did not stick.
+- `DRONE_HOVER_THROTTLE` 1475 -> 1480, `DRONE_ALTITUDE_HOLD_K` 45 -> 90.
+
+**Flight dynamics changed here (rate loops much softer, d=0), so no eval number
+or model from before 08-23 is comparable to anything after it.**
+
+### Velocity input (09-01, unconditional — no config flag)
+
+`LinearModel.forward(img, imu, vel)` takes heading-frame velocity through a
+small MLP branch. `tub_schema.heading_frame_velocity()` + `VELOCITY_SCALE` are
+imported by BOTH `dataset.py` and `torch_pilot.py` so the transform cannot
+drift; velocity is rotated into the drone-heading frame and scaled by 5,
+matching `GateChaseEnv._get_obs()[5:8]`. `drone_manage.py` REFUSES to start if
+`DRONE_RECORD_VELOCITY`/`ATTITUDE` are off.
 
 Pre-velocity 4-output checkpoints are detected by `checkpoint_kind()` as
-`pre_velocity` (no `vel_fc.0.weight`) and rejected with an explicit message
-instead of a confusing `load_state_dict` error. `models/bc_rl_dagger1.pth` and
-`models/bc_rl_v4best_pwm.pth` are both in that category now.
-
-### Verified: inference matches training to 1.7e-5
-
-Feeding the same tub records through `TubDataset`+`LinearModel` and through
-`TorchPilot` sequentially agrees to **1.73e-05** max, once the IMU history has
-filled. The first two frames of any such comparison MUST differ — TorchPilot's
-history starts zero-filled while the dataset has a full window. Do not read
-that as a bug (it cost time here).
-
-### BUG FOUND AND FIXED: TorchPilot resize was not antialiased
-
-`TubDataset` resizes with PIL (antialiased); `TorchPilot` used
-`F.interpolate(bilinear)` WITHOUT antialias. At the 4x downscale from the
-640x480 camera to 120x160 that aliases hard:
-
-    max pixel difference   0.355  (35% of full range)  ->  0.0029 with antialias
-    steady-state output    1.15e-03                    ->  1.73e-05  (66x)
-
-**Every flight eval before 2026-09-01 ran on images subtly different from what
-the model trained on.** Now `antialias=True`. Same failure class as the
-120x160 resolution gotcha and the PWM-space flag: silent, no error.
-
-### Flight result: real but partial
-
-5 runs x 60s, 20Hz, slalom_gates_80mm:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger (no vel) | 5/5 | 36.5s | 0.2 | 1.22-1.43 | 0.52-0.98 |
-| **DAgger + velocity** | 5/5 | **37.4s** | **0.4** | **1.10-1.29** | **0.57-0.63** |
-
-`models/bc_vel_dagger1.pth`, best val 0.038066 (not comparable across
-architectures).
-
-What velocity bought: altitude variance is now CONSISTENT (0.57-0.63, no more
-0.98 outliers), mean height is the tightest yet, and the gate regression from
-the no-velocity DAgger round reversed (0.2 -> 0.4). One episode flew 57.7s and
-passed 2 gates.
-
-What it did NOT buy: the crashes. Still 5/5, still every episode ending at
-alt_min 0.12 (the crash threshold). The oscillation is damped and regularised,
-not eliminated — alt_std 0.57-0.63 against 0.36-0.47 for the damper alone.
-
-**So the observability hypothesis was PARTIALLY right.** Velocity was a genuine
-missing input, and the evidence for that is the tighter, more consistent
-altitude control. But it was not the cause of the floor crashes. Do not expect
-another input to fix this on its own.
-
-### Ruled out this session
-
-- Control-loop timing: `loop delay: avg=50.0ms` (exactly 20Hz, min 45 max 55),
-  inference 11.5ms = 23% of the period. The loop is not falling behind and
-  latency is not pathological.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-1. The remaining failure is a slow vertical oscillation that persists across
-   every label-side and input-side fix. Instrument the actual z trajectory
-   (period and phase vs the altitude command) rather than summary stats —
-   `eval_flight.py` records `track` but only reports aggregates. If the command
-   LAGS z by ~90 degrees, it is a phase/feedback problem, not a fit problem.
-2. Compare directly against the teacher flying the same course with
-   `gate_rollout.py`: the teacher holds this axis fine with the same actuator,
-   so a side-by-side z trace localizes what the student does differently.
-3. DAgger round 2 is now reasonable (round 1 aggregated cleanly and the
-   velocity input makes the target representable), but expect incremental
-   gains, not a fix.
-
-
-## Current Handoff (2026-09-05, root cause FOUND: it was never an oscillation)
-
-**STATE: stopped, nothing running.** The altitude failure is now fully
-explained and quantitatively confirmed. It is NOT a vertical oscillation, not
-compounding error, and not a fit problem. Do not spend more effort on label
-weighting, representation, DAgger rounds, or extra inputs for this.
-
-### Root cause: a ~5 PWM constant thrust bias, integrated by a plant with no height regulation
-
-`DRONE_ALTITUDE_HOLD_K` is a pure VELOCITY damper (bias = -K*vz, K=90). It has
-no position term, so the plant has no altitude regulation at all: any steady
-thrust bias B settles at a constant sink rate `vz = B / K` and integrates
-straight into the floor. Nothing arrests it.
-
-The student emits exactly such a bias. Measured over the steady phase (first 5s
-of takeoff transient excluded), with the prediction from `vz = B/K`:
-
-| episode | mean cmd | predicted vz | actual vz |
-| --- | --- | --- | --- |
-| student ep0 | -9.3 PWM | -0.104 | **-0.100** |
-| student ep1 | -4.6 PWM | -0.051 | **-0.053** |
-| student ep2 | -4.9 PWM | -0.055 | **-0.048** |
-| student ep3 | -4.8 PWM | -0.053 | **-0.057** |
-| teacher (4 eps) | -0.8..+1.3 PWM | ~0 | +0.02..+0.04 |
-
-The model predicts the observed sink to within 0.005 m/s in every episode, and
-the predicted time-to-floor (17/30/34/29s) matches the observed episode lengths
-(22/35/40/34s). A 5 PWM bias is **2.5% of full scale** and is invisible in
-val_loss — but it is fatal, because the plant integrates it.
-
-### Why "oscillation" was the wrong read
-
-`alt_std` 0.57-0.62 looked like an oscillation in the summary stats. The actual
-z trace (`eval_flight --trace`) shows a monotonic descent with the command
-pushing DOWN the whole way: from t=17s to the crash, vz is negative on nearly
-every sample and the command is negative too (-9 to -16 PWM). Per-vz bins make
-it stark — while sinking at vz in [-0.3,-0.1] (1020 of the student's steps) the
-student commands **-12.7 PWM** where the teacher commands -0.6.
-
-Ruled out along the way, all with data:
-
-- **Not position feedback / phase lag.** corr(cmd, -vz) is 0.60 for the student
-  and 0.60 for the teacher — the student learned the right control LAW. Its lag
-  is 0.20s vs the teacher's 0.06s, but that is ~1% of the 19s period, far too
-  little to destabilize.
-- **Not damper disengagement.** The student exceeds the 0.1 deadband on only
-  0.73% of steps, and the last disengagement is 21-35s BEFORE each crash.
-  (The teacher never exceeds it: max |cmd| = 0.090, exactly its action clamp.)
-- **Not saturation.** Neither saturates (0.6-0.7% of steps).
-- **Not control-loop timing.** 50.0ms period, inference 11.5ms (ruled out 09-01).
-
-What IS different is command AMPLITUDE: the teacher modulates +-39 PWM (std
-39.4) around ~0; the student sits in a narrow band (std 13.0) offset to -7.8.
-Its effective damping gain is 7.8 PWM per m/s vs the teacher's 51.9. Offline
-shrinkage on the tubs is only 0.68-0.74x, so closed-loop amplitude loss is
-larger than the offline fit suggests.
-
-### Confirmed by experiment: remove the DC, the crashes stop
-
-`eval_flight.py --alt-highpass=TAU` high-passes the altitude command in PWM
-space (DC station-keeping is the damper's job; the model supplies modulation).
-5 runs x 60s, 20Hz:
-
-| config | crash | survival | gates | alt_mean | alt_std | mean cmd |
-| --- | --- | --- | --- | --- | --- | --- |
-| student raw | 4/4 | 32.7s | 0.25 | 1.15-1.23 | 0.57-0.62 | -5.9 PWM |
-| **student + highpass** | **0/5** | **60.0s** | 0.40 | 2.37-2.76 | **0.21-0.45** | **-0.2 PWM** |
-| teacher | 0/4 | n/a | **3.00** | 1.57-1.72 | 0.13-0.17 | -1.9 PWM |
-
-Mean vz went -0.05 -> +0.006..+0.021 and every episode survived the full 60s.
-That closes the loop on the diagnosis.
-
-But it is NOT a complete fix: with DC removed there is no station-keeping
-either, so the drone drifts up to 2.4-2.8m (peaks 3.0-3.5m) against a 0.2-3.0m
-gate window, and gates stay at 0.4. Same shape as the older `--zero-altitude`
-result (3.1-3.5m), just less extreme. **DC authority is what holds height** —
-the teacher's DC is small but not zero (-1.9 PWM) and it holds 1.57-1.72m.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-The student must produce a DC term accurate to ~2 PWM (2% of full scale) to
-hold height open-loop. That is an unreasonable ask of a regression model, and
-it is the actual reason every data-side fix failed. Two ways forward, in order:
-
-1. **Fix the plant, not the student (recommended).** Give the altitude hold a
-   POSITION term — make it a PD hold about a height setpoint instead of a pure
-   velocity damper, so a small thrust bias produces a small steady-state offset
-   instead of an unbounded sink. The student''s command then becomes a height
-   trim request rather than raw thrust, and a 5 PWM error stops being fatal.
-   This also fixes the plant fragility for every future model. Note the teacher
-   was trained against the velocity-damper plant, so it would need retraining
-   or re-validation against the new dynamics.
-2. **Or train the DC explicitly.** Add a loss term on the mean altitude command
-   over a window (the current per-sample Huber is dominated by AC modulation and
-   cannot see a 2% DC offset). Cheaper, but leaves the fragile plant in place.
-
-Do NOT: re-tune TRAIN_LOSS_WEIGHTS, add more inputs, or run DAgger round 2 for
-this failure. All three were tried and none address a DC calibration error.
-
-### Added this session
-
-| path | purpose |
-| --- | --- |
-| `eval_flight.py --trace` | per-step z / vz / altitude-command trace into the metrics JSON |
-| `eval_flight.py --alt-highpass=TAU` | remove the command''s DC thrust bias (diagnostic + partial fix) |
-| `eval_flight.py --alt-gain=G` | scale the command in THRUST space (raw * G**5); note the PWM curve is so compressive that G=4 saturates |
-| `gate_rollout.py --trace-output` | same trace shape for the teacher, for side-by-side comparison |
-| `scripts/alt_phase.py` | period + phase analysis: separates velocity damping from position feedback from lag |
-
-
-## Current Handoff (2026-09-05b, PD altitude hold: plant FIXED, models now stale)
-
-**STATE: stopped, nothing running.** The altitude hold now has a position term.
-It fixes the plant fragility completely. The side effect is that BOTH the RL
-teacher and the BC student are now trained against the wrong plant, so gate
-performance regressed and they need retraining.
-
-### What changed
-
-`DroneGymEnv._rc_channels` altitude hold is now two modes, split by the
-existing command deadband:
-
-    |alt| >= deadband : explicit climb/descent. Direct thrust, and the held
-                        height follows the drone (unchanged behaviour).
-    |alt| <  deadband : HOLD. bias = -Kp*(z - z_target) - K*vz, about a FROZEN
-                        setpoint, where z_target = setpoint + alt_scaled*TRIM.
-                        The command trims the target HEIGHT; it no longer adds
-                        thrust.
-
-New config (`drone_config_80mm.py`):
-
-    DRONE_ALTITUDE_HOLD_KP   = 30.0   # PWM per metre of height error
-    DRONE_ALTITUDE_TRIM_RANGE = 1.0   # metres of setpoint authority in-deadband
-
-`DRONE_ALTITUDE_HOLD_KP = 0` reproduces the old pure-velocity damper exactly,
-and is the default when unset — so **65mm is unaffected** (it does not set it).
-The setpoint is cleared on every teleport/reset alongside `reset_history()`.
-
-Gain sizing: thrust slope near hover is ~0.01 m/s^2 per PWM, so w^2 = 0.01*Kp
-and 2*zeta*w = 0.01*K = 0.9. Kp=30 gives w=0.55 rad/s, zeta=0.82 (well damped),
-and turns a 5 PWM bias into a 0.17m offset instead of an unbounded sink.
-
-### It works: the plant is no longer fragile
-
-`probe_hover.py` (neutral stick, 30s): z pinned at **0.30-0.31m, vz 0.00**,
-throttle steady 1477-1478. On the old plant the same probe drifted 0.5 -> 2.1m.
-
-Student `bc_vel_dagger1`, 5 x 60s, 20Hz:
-
-| plant | crash | survival | alt_std | mean vz |
-| --- | --- | --- | --- | --- |
-| velocity damper (old) | 4/4 | 32.7s | 0.57-0.62 | -0.05..-0.10 |
-| PD hold (new) | **0/5** | **60.0s** | **0.04-0.09** | **-0.003..0.000** |
-
-Altitude variance improved ~10x, and is now TIGHTER than the teacher ever
-achieved on the old plant (0.13-0.17). Vertical drift is gone entirely. The
-plant is doing the regulating, which is the point.
-
-### The cost: both models are now trained against the wrong plant
-
-Their altitude commands meant "thrust"; they now mean "height trim". Deterministic
-`gate_rollout.py`:
-
-| teacher | episodes 3/3 | gates | z mean | z range |
-| --- | --- | --- | --- | --- |
-| old plant | 10/10 (and 4/4) | 12/12 | 1.64 | 1.18-2.01 |
-| PD plant | 2/6 | 14/18 | 1.35 | 1.00-1.99 |
-
-The student holds rock-steady but at ~2.0-2.4m, and gates went 0.25 -> 0.20.
-Two separate causes, do not conflate them:
-
-1. **Stale semantics.** Expected and unavoidable; fixed by retraining.
-2. **Takeoff capture height.** `eval_flight` climbs at `--climb-altitude=0.15`,
-   which is ABOVE the 0.1 deadband, so the setpoint follows the drone until
-   handover — and climb momentum carries it to ~2.4m before the hold freezes.
-   The drone then holds 2.4m against gates at 1.5m, with only +-0.63m of trim
-   authority to fix it. This is a takeoff-tuning bug, NOT a model failure, and
-   it is worth fixing before drawing any conclusion from gate counts.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next
-
-1. **Fix the takeoff capture height first** (cheap, and it confounds everything
-   else): arrest the climb and let the hold freeze near `start_alt`, the way
-   `rl_env._arrest_climb` already does for RL episodes. Verify the student holds
-   ~1.5m rather than ~2.4m before judging gates.
-2. **Retrain the teacher on the new plant** (~4h,
-   `./scripts/rl_train.sh --total-steps=400000 --out=models/rl/ppo_gates_v5
-   --control-altitude --altitude-scale=0.09`). Pick the checkpoint by
-   deterministic `gate_rollout.py`, not final step count (see 2026-08-24).
-   Consider whether `--altitude-scale` still wants to be 0.09: the axis is now a
-   position trim inside the deadband, not thrust, so the old reasoning about
-   keeping commands inside the deadband still applies but the authority it buys
-   is different (0.09 -> ~0.39m of trim at TRIM_RANGE=1.0).
-3. **Then re-collect and re-distill** (`rl_collect.py`, `torch_train.py`). The
-   existing tubs (15/16/17) were recorded on the old plant and their altitude
-   labels no longer mean what they meant; do not mix them with new data.
-4. `DRONE_ALTITUDE_TRIM_RANGE=1.0` was chosen analytically, not tuned. On the
-   new plant the teacher uses ~45 PWM mean command = ~0.45m of trim, against
-   z excursions of ~0.2m on the old plant, so it may now be over-responsive.
-   Worth a sweep once the teacher is retrained.
-
-### Note for interpreting old results
-
-Any eval or tub from before this change ran on a plant with NO height
-regulation. Altitude numbers are not comparable across the change, the same way
-the 2026-08-23 PID retune invalidated earlier flight comparisons.
-
-
-## Current Handoff (2026-09-06, v5 teacher on the PD plant: altitude SOLVED, lateral is now the wall)
-
-**STATE: stopped, nothing running.** `models/rl/ppo_gates_v5` trained to 611k
-steps on the PD-hold plant and was stopped deliberately (see budget bug below).
-`model.zip` holds the promoted 600k checkpoint.
-
-### The takeoff capture fix worked, and it alone moved gates
-
-`eval_flight._takeoff` now arrests the climb (waits for |vz|<0.15) and then
-calls the new `DroneGymEnv.set_altitude_setpoint(start_alt)`, so episodes begin
-at a repeatable height instead of wherever momentum left the setpoint.
-`rl_env._arrest_climb` does the same. Same student model, no retraining:
-
-| | before | after |
-| --- | --- | --- |
-| episode start z | 2.30-2.40 | **1.63-1.64** |
-| alt_mean | 2.24-2.44 | **1.43-1.52** (gates at 1.50) |
-| gates | 0.2 | **1.0** |
-
-The old numbers were measuring a drone parked above the gates.
-
-### BUDGET BUG: the run cannot terminate on its own
-
-`rl_train.sh` restarted 8 times (BetaFlight SITL flakiness, expected). Every
-resume passes `--total-steps=400000` again, and on resume that means 400k
-ADDITIONAL steps (SB3 semantics, already documented). So each restart granted a
-fresh 400k and the run reached 611k of a nominal 400k with no end in sight.
-Resume/promotion all worked correctly -- no progress was ever lost -- but the
-BUDGET is unbounded. **Fix before the next long run:** have `rl_train.sh`
-compute remaining steps as `total - already_done` when resuming, or pass an
-absolute target and let it subtract.
-
-### The plant fix did exactly what it was supposed to
-
-Deterministic `gate_rollout.py`, 10 episodes, v5 @600k:
-
-    crossings=29 passes=19 (66%)
-    misses by lateral=10, by height=0
-    height at crossing: mean 1.73m, min 1.22, max 2.62 (band 0.2-3.0)
-    |lateral offset|: mean 1.03m, median 0.52m, max 5.01m (window 0.9m)
-
-**Zero height misses.** Altitude is no longer a failure mode for the teacher at
-all, which is precisely what the PD hold was for. Compare v3 on the old plant,
-which missed 17/17 crossings on HEIGHT.
-
-### But the teacher is much weaker than v4, and it is all lateral
-
-| teacher | plant | 3/3 episodes | gates |
-| --- | --- | --- | --- |
-| v4 @340k (best) | velocity damper | 10/10 | 30/30 |
-| v4 @400k (final) | velocity damper | 3/10 | 23/30 |
-| **v5 @600k** | **PD hold** | **3/10** | **19/30** |
-
-v5 is still IMPROVING, not decayed (windowed 3/3 went 10% at 280k -> 17% in the
-last 60 episodes), but it is far off v4 at 1.5x the steps. Its episodes are also
-slower: mean 413 steps vs v4''s 307 at peak. 96% complete the course; they just
-miss gates sideways.
-
-### Leading hypothesis for the next run: DROP the altitude axis
-
-With the PD hold, the altitude action is close to a no-op -- the plant holds
-height whatever the policy does, and the rollout shows 0/29 height misses. A
-4-action policy is therefore spending exploration on a dimension that barely
-affects the outcome, which is a plausible cause of the slower lateral learning.
-
-`--control-altitude` was originally added (v3 -> v4) *because* the old plant had
-no height regulation and a 3-action policy flew over the gates. **That reason no
-longer exists.** A 3-action policy (obs 19) on the PD plant is the natural
-configuration and has a smaller search space.
-
-This is a hypothesis, not a measured result. The alternative is simply that v5
-needs more steps.
-
-### BUG FIXED: the trainer deployed a worse model than it found
-
-`torch_train.py` used one test for two different questions -- "are these the
-best weights so far?" and "should we stop?" -- via
-`val_loss < best_val_loss - MIN_DELTA`, where `MIN_DELTA` is an **absolute**
-0.0005. That is sane at the ~0.01 losses of human-piloted tubs. It breaks
-completely at expert-distillation scale, where the student reaches ~0.0003 and
-the threshold is larger than the entire remaining loss, so no improvement can
-ever clear it.
-
-Observed on the first `tub_19` run: epochs 5, 7, 9 and 10 each beat the running
-best and **none were saved**. The deployed model was epoch 8 (val 0.000654)
-while epoch 10 reached 0.000317, and patience then expired on those same real
-gains. Silent -- the log cheerfully reported "Best val_loss: 0.000654".
-
-Now the two are separate: weights are saved on ANY true improvement, and
-patience uses a scale-aware threshold (`MIN_DELTA_REL`, default 1% of the
-current best, with optional `MIN_DELTA_ABS` floor) so it behaves identically at
-0.01 or 0.0003. Replaying the observed loss sequence through the new logic keeps
-0.000317 and still stops at epoch 13.
-
-`models/bc_expert_v1_epoch8_stale.pth` is the pre-fix artifact, kept only for
-comparison; delete it once `bc_expert_v1.pth` is validated.
-
-The fix changed the outcome materially. Retrained on the same tub, the run went
-33 epochs instead of stopping at 13, and best val went **0.000654 -> 0.000158**,
-a 4.1x improvement that the old code discarded.
-
-### The student: models/bc_expert_v1.pth
-
-Trained on `data/tub_19_26-09-06` alone, best val 0.000158 at epoch 28 of 33.
-Offline fidelity on that tub (in-sample, so optimistic, but the val loss agrees):
-
-| axis | MAE | corr | previous best student (bc_rl_v4best_pwm) |
-| --- | --- | --- | --- |
-| yaw | 0.0060 | **0.9995** | 0.97 |
-| pitch | 0.0051 | **0.9982** | 0.98 |
-| roll | 0.0090 | **0.9997** | 0.99 |
-| altitude | 0.0162 | **0.9365** | 0.86 |
-
-Altitude MAE 0.0162 is ~1.6cm of height-target error at `TRIM_RANGE=1.0`.
-Under the old thrust semantics the comparable error was 4.89 PWM of sustained
-thrust, which integrated into the floor. Same axis, same fit quality, entirely
-different consequence -- that is the whole point of the interface change.
-
-### Closed-loop student result, and the NEXT structural blocker
-
-`eval_flight.sh --model=models/bc_expert_v1.pth --world=slalom_gates_80mm
---runs=5 --duration=60 --rate-hz=20`:
-
-| config | crash | survival | gates | alt_mean | alt_std |
-| --- | --- | --- | --- | --- | --- |
-| BC PWM space (old plant) | 5/5 | 18.4s | 0.4 | 0.93-1.63 | 0.57-0.81 |
-| DAgger + velocity (old plant) | 5/5 | 37.4s | 0.4 | 1.10-1.29 | 0.57-0.63 |
-| **expert-distilled, velocity mode** | **0/5** | **60.0s** | **1.0** | **1.40-1.42** | **0.11-0.12** |
-
-**The altitude problem is over.** alt_std 0.11-0.12 against 0.57-0.81 for every
-previous student, and 0.36-0.47 for the bare damper. Zero crashes, five for
-five, where every prior configuration that commanded altitude crashed five for
-five. That is the interface change doing exactly what it was for, and it should
-not need revisiting.
-
-**Gates are now limited by something else, and it is not the fit.** All five
-episodes are near-identical: gate 1 passed at 3.0-4.0s, then nothing for the
-remaining 57s while the drone flies on (87m of path, 29m max displacement) in
-perfect control. Offline fidelity is 0.999/0.998/1.000/0.937, so the student
-reproduces the expert almost exactly on the states it was shown.
-
-**Root cause: the next gate is outside the camera at the moment of the turn.**
-The camera is `horizontal_fov 1.39626` = 80 degrees, so +-40 degrees of view.
-The slalom's geometry forces a larger turn than that:
-
-| transition | world bearing | exit heading | relative bearing |
-| --- | --- | --- | --- |
-| gate 1 -> gate 2 | -38.7 deg | +28.6 deg | **-67.3 deg** |
-| gate 2 -> gate 3 | +38.7 deg | -28.6 deg | **+67.3 deg** |
-
-The drone exits each gate aligned with THAT gate's normal, which points it away
-from the next one. The instrumented expert agrees: measured bearing to the next
-target right after a crossing is +67.9 and -87.2 degrees. Both are far outside
-+-40, so at the instant the expert commits to the turn, the student is looking
-at empty space. It is being asked to regress a label computed from a gate it
-cannot see -- the same class of problem as the velocity-observability finding of
-2026-08-31, but about gate position.
-
-Do NOT attack this with more data, more DAgger, or loss weights. The student
-passes the gate it CAN see and fails the ones it cannot.
-
-### FIX APPLIED: camera widened 80 -> 140 degrees, confirmed visually
-
-`~/dev/aeroloop_gazebo/models/betaloop_drone_cam_80mm/model.sdf`:
-`horizontal_fov` 1.39626 -> **2.44346** (80 -> 140 degrees). The old file is
-backed up next to it as `model.sdf.fov80.bak`. Real FPV racing lenses are
-150-170 degrees, so 80 was the artificial value, not 140.
-
-Confirmed by rendering the actual view from the pose where the student went
-blind -- position (5.21, 1.97, 1.57), yaw +17.7 deg, i.e. just after crossing
-gate 1. Both images are in `docs/fov/`:
-
-- `turn_view_fov80.png`: **only the distant gate 3 is visible, near centre.**
-  Gate 2 (relative bearing 57.3 deg) is entirely out of frame. The student saw
-  a far-off gate roughly straight ahead and no reason to turn -- which is
-  exactly what it did: pass gate 1, fly on, never crash, never turn.
-- `turn_view_fov140.png`: gate 2 is large and unmistakable on the right, with
-  gate 3 still visible in the distance.
-
-The 80 deg image is a geometrically exact reconstruction (the central +-40 deg
-crop of the 140 deg frame; same optical centre and axis), not a re-render.
-
-**Cost of the change**, which is real and worth remembering: the projection is
-pinhole, so centre angular resolution degrades from 0.15 to 0.49 deg/px (focal
-length 381 -> 116 px) and the frame edges stretch hard. Distant gates are ~3.3x
-smaller in pixels than before. If that turns out to hurt, the principled fix is
-Gazebo's `wideanglecamera` sensor with an equidistant lens, which spends pixels
-uniformly across the field instead of piling them at the edges; it was not used
-here because changing the sensor type risks the topic path the camera worker
-depends on.
-
-**This invalidates every tub recorded before it**, `tub_19` included -- the
-optics differ, so the images are from a different sensor. `models/bc_expert_v1.pth`
-is likewise 80-deg-only. The 65mm model SDF was NOT changed.
-
-Re-collected at 140 deg: `data/tub_20_26-09-06`, **10,693 rows, 40/40 kept, 0
-dropped**, again all 3/3. The expert is unaffected by the optics (it flies on
-privileged state), so the yield stayed at 100%.
-
-| tub | FOV | rows | use |
-| --- | --- | --- | --- |
-| `tub_18_26-09-06` | 80 deg | 558 | smoke artifact, delete |
-| `tub_19_26-09-06` | 80 deg | 10,717 | superseded, wrong optics |
-| **`tub_20_26-09-06`** | **140 deg** | **10,693** | **current training set** |
-
-### The 140-degree student: models/bc_expert_fov140.pth
-
-Trained on `data/tub_20_26-09-06` alone, 31 epochs, best val **0.000097**
-(against 0.000158 for the 80-deg model). Offline fidelity improved on every
-axis despite the 3.3x coarser centre resolution -- the wider field evidently
-buys more than the lost pixels cost:
-
-| axis | 80 deg (bc_expert_v1) | 140 deg (bc_expert_fov140) |
-| --- | --- | --- |
-| yaw | 0.9995 | **0.9997** |
-| pitch | 0.9982 | 0.9980 |
-| roll | 0.9997 | **0.9997** |
-| altitude | 0.9365 | **0.9659** |
-| best val loss | 0.000158 | **0.000097** |
-
-### The wider camera did NOT fix gates. It changed the failure, not the count.
-
-`eval_flight`, 5 x 60s, 20Hz, `bc_expert_fov140.pth`: crash 0/5, survival 60.0s,
-**gates 1.0** -- identical headline to the 80-deg student. But the behaviour is
-qualitatively different:
-
-| | 80 deg | 140 deg |
-| --- | --- | --- |
-| gates | 1.0 | 1.0 |
-| max displacement | 28.0-29.4m | **16.7-21.1m** |
-| path length | 86.8-87.7m | **20.6-80.3m** (highly variable) |
-| alt_std | 0.11-0.12 | **0.01-0.03** |
-| which gate | gate_1 every time | gate_1 x4, **gate_3 once** |
-
-The 80-deg student flew a consistent straight line past everything (87m of path,
-29m out). The 140-deg student stays close (17-21m), flies erratic distances --
-one episode covered only 20.6m in 60s, an average of 0.34 m/s, i.e. nearly
-hovering -- and in one episode passed gate 3 instead of gate 1.
-
-**Read that as indecision, not blindness.** The narrow camera made the student
-fly confidently the wrong way; the wide one makes it dither. That is what you
-would expect if the student can now SEE the next gate but cannot tell WHICH gate
-to chase.
-
-**Confirmed from the ground track** (`eval_flight --trace` now records x/y/yaw,
-added for this). Two episodes, both 2/3:
-
-    ep0  gate_1 @ 4.25s, gate_3 @ 15.9s     ep1  gate_1 @ 4.9s, gate_3 @ 16.7s
-      t=5.6  (7.25, +2.32)                    t=5.6  (5.90, +2.67)
-      t=8.4  (10.96, +1.75)   <-- gate 2      t=8.4  (9.70, +2.86)   <-- gate 2
-      t=11.2 (14.44, +0.01)       is at        t=11.2 (12.97, +0.36)      is at
-      t=14.0 (16.20, +2.01)       y = -2       t=14.0 (16.16, +1.44)      y = -2
-
-The student flies **gate 1 -> gate 3, skipping gate 2 entirely**. It crosses
-x=10 at y = +1.8 to +2.9 while gate 2 sits at y = -2; it never makes the dip.
-After reaching gate 3 it mills around it for the remaining 30s, since nothing
-lies beyond.
-
-The mechanism is a direct consequence of the fix: after gate 1, gate 3 is nearly
-straight ahead (17 deg off the nose) while gate 2 needs a 57 deg right turn. The
-expert knows to chase gate 2 because it tracks `gate_idx`. The student sees two
-near-identical gates in one frame with no ordering cue and flies to the centred
-one. **Widening the field made the target visible and the target ASSIGNMENT
-harder at the same time.**
-
-Note this is NOT a fit problem: offline corr is 0.9997/0.9980/0.9997/0.9659 and
-val loss 0.000097, the best of any model in this project. The student reproduces
-the expert almost exactly on states it was shown. It cannot resolve which gate
-is next from one frame, because that information is not in one frame.
-
-### Do this next (pick one)
-
-1. **Retrain 3-action on the PD plant** (drop `--control-altitude`). Smaller
-   action space, and the plant now owns altitude. Starts from scratch, ~6-10h.
-2. **Resume v5** (`--resume` is automatic; it was still improving). Cheaper, but
-   it is 1.5x past v4''s step count at a fifth of the 3/3 rate, so the return is
-   uncertain. Remember the additive-steps semantics when setting the budget.
-
-Either way: pick the final checkpoint by deterministic `gate_rollout.py`, never
-by final step count.
-
-### Also worth noting
-
-- RL takeoff heights spread 1.44-1.91m (mean 1.72) against the 1.50 target --
-  only 15% land within 0.15m. `eval_flight` hits 1.63-1.64 reliably, so the
-  `rl_env` convergence loop (4s budget, 0.15m tolerance) gives up early. Harmless
-  for robustness (spawns are jittered anyway) but it means the teacher trained
-  from a looser start distribution than intended.
-- `DRONE_ALTITUDE_TRIM_RANGE=1.0` is still un-swept.
+`pre_velocity` (no `vel_fc.0.weight`) and rejected with an explicit message.
+Every checkpoint from before 09-01 is in that category.
+
+Caveat owned deliberately: on real hardware vz needs a barometer or
+optical-flow estimate. Fine for sim; a real-airframe port needs an estimator.
+
+### Lessons that still bind (do not regress)
+
+Plant and telemetry:
+
+- **Never call gz services in-process from training/eval code.** Requests from
+  a torch-loaded process reliably time out, and enough timed-out in-process
+  requests wedge Gazebo's UserCommands service for ALL callers until the stack
+  restarts. Use a subprocess (`gz_camera_worker.py`, `gz_reset_worker.py`).
+- **gz `set_pose` does NOT zero velocity** — after a flyaway the drone carries
+  its momentum through the teleport.
+- **Velocities SATURATE at `MAX_VELOCITY`, never zero.** They were once zeroed
+  above 20 m/s to hide teleport spikes; the altitude damper reads that same
+  value, so past 20 m/s it saw `vz=0`, applied no correction, and the drone
+  climbed unchecked. Teleports call `reset_history()` to drop the stale sample
+  instead.
+- **Neutral throttle does not lift the drone off the ground**, so a landed
+  reset needs a real climb command. Takeoff must ramp and cut at LIFTOFF, not
+  power to `start_alt`: throttle authority is ~+-100 PWM and the band between
+  "won't leave the ground" (0.15) and "rockets to 9m" (0.6) sits inside it.
+  Then arrest the climb and freeze the hold setpoint.
+- **The altitude hold only regulates inside the command deadband**
+  (`DRONE_ALTITUDE_HOLD_DEADBAND`, 0.1 for 80mm). Commanding altitude during a
+  reset switches off the thing that arrests the drone; reset loops command 0.0.
+- When resets misbehave, log pos AND vel together — position alone cannot
+  distinguish "teleport failed" from "teleport worked, drone flew away". x/y
+  pinned exactly on target while z runs away means the teleport is fine and
+  something is driving it vertically.
+
+Measurement:
+
+- **The sim has NO vertical drag**, so open-loop climb *rate* at a PWM is
+  meaningless (it just preserves entry momentum). Measure vertical
+  *acceleration* (quadratic fit of z(t)), or close the loop.
+- `test_thrust.py --mode=hover` sweeps from the ground and ground contact masks
+  the true hover point. Measure hover airborne.
+- A PI-on-vz "hover finder" reads ~40-60 PWM low while it is actively
+  stabilizing (active PID activity adds rectified thrust even with tame gains).
+  Trust ballistic holds entered at ~zero vz, cross-checked against static
+  thrust math (km=1.9e-7, maxRpm=2094, mass 0.079kg -> hover ~= motor 1482).
+- BetaFlight refuses CLI while armed, and a CLI socket needs ~0.3s after
+  connect before sending '#' or it never answers.
+
+Training and models:
+
+- **`TorchPilot`/`LinearModel` must be built at `TRAIN_IMAGE_H/W` (120x160)**,
+  not the camera's 640x480. `AdaptiveAvgPool` means a 640x480 model loads the
+  same state_dict without error and silently returns badly biased predictions.
+  If an offline check disagrees wildly with the reported val_loss, suspect the
+  resolution before the model.
+- **`TorchPilot`'s resize must stay antialiased.** It once used
+  `F.interpolate(bilinear)` without antialias while `TubDataset` used PIL; at
+  the 4x downscale that aliased hard (max pixel difference 0.355 of full range;
+  0.0029 with antialias). Every flight eval before 2026-09-01 ran on images
+  subtly different from training. Same silent failure class as the resolution
+  gotcha and the `TRAIN_ALTITUDE_PWM_SPACE` flag.
+- **Do not mix tubs across a control-mapping change.** tub_12 (45-deg pitch)
+  and tub_13 (20-deg) carry ~2.25x different labels for the same physical
+  maneuver; the combined model crashed 3/3 while each alone trained fine.
+- Inference matches training to 1.7e-5 when checked correctly. **The first two
+  frames of any such comparison MUST differ** — `TorchPilot`'s history starts
+  zero-filled while the dataset has a full window. That is not a bug.
+- Control-loop timing is not a suspect: measured `loop delay avg=50.0ms` at
+  20Hz (min 45, max 55) with inference at 11.5ms, 23% of the period.
+
+If the RL teacher is ever revived:
+
+- **Pick the teacher by deterministic `gate_rollout.py`, never by final step
+  count.** v4's 340k checkpoint scored 10/10 episodes; its own 400k final
+  scored 3/10.
+- **On `--resume`, `--total-steps` means that many ADDITIONAL steps** (SB3
+  semantics). `rl_train.sh` passes the same value on every supervisor restart,
+  so a run that restarts 8 times gets 8 fresh budgets — v5 reached 611k of a
+  nominal 400k. **This is still UNFIXED**: have the script compute
+  `total - already_done`.
+- `rl_train.sh` is a supervisor (BetaFlight SITL randomly aborts at launch and
+  randomly resets its MSP socket during the post-reboot config step); it
+  retries up to `RL_MAX_ATTEMPTS` (40), rebuilding and resuming each time.
+- Resume is safe now: before choosing a resume the script runs
+  `promote_checkpoint.py --once`, so a run killed by a signal (progress only in
+  `checkpoints/`) is promoted and resumed rather than silently restarted from
+  step 0. If checkpoints exist but none can be promoted it refuses with exit 2.
+  A clean final `model.zip` is never clobbered.
+- Throughput is reset-dominated, not the flying time `rl_train.py` prints:
+  ~5 env steps/sec early, approaching 20/sec as episodes lengthen. Budget
+  10-20h for 400k, not 6h.
+- `<out>/env_config.json` records rate/altitude-scale/etc so a teacher is flown
+  exactly as trained; it does not exist until the run finishes.
+- `--control-altitude` was added because the OLD plant had no height
+  regulation. With the PD hold that reason is gone, and v5 saw 0/29 height
+  misses — a 3-action policy is the natural configuration now.
+
+Stack lifecycle:
+
+- `stop_all.sh`'s wrapper kill is ANCHORED to a shell actually executing the
+  script (`pgrep -f '^[^ ]*/?bash[^ ]* [^ ]*scripts/start\.sh'`). The
+  unanchored pattern matched any process whose command line merely MENTIONED
+  the path and killed a training command mid-launch. It also kills the
+  `tail -f /dev/null` keepalive child FIRST, and skips any `start.sh` that is
+  calling it (`start.sh` runs `stop_all.sh` from its own EXIT trap).
+- BetaFlight SITL intermittently aborts at launch (heap corruption in
+  openSerialPort/stream_initAddress, macOS ARM64) — random per launch, not
+  eeprom, not config. `start.sh` retries 5x with 2s pauses. Crash reports land
+  in `~/Library/Logs/DiagnosticReports/`.
+- A disarmed board can never take off, so `reset()` re-raises immediately when
+  `env.bf_armed` is false rather than burning retries.
+
+### Dead artifacts from this era
+
+Models `models/rl/ppo_gates_v1` .. `v5` (and `smoke`, `reset_check`) are all
+superseded: v1/v2 trained against the oscillating plant, v3 has no altitude
+axis (its checkpoints will not load in a 4-action env), v4/v5 predate the
+velocity-setpoint interface. Tubs 12-17 predate the interface change AND the
+140-degree camera; every checkpoint before 2026-09-01 is `pre_velocity`.
+
+### Still open from this era
+
+- **65mm has never been re-tested airborne** on the tamed pitch/roll PID gains
+  (08-23) or the corrected yaw scaling (09-06b). It does not set
+  `DRONE_ALTITUDE_HOLD_KP` or `DRONE_VELOCITY_CONTROL`, so it is otherwise
+  unaffected by the plant and interface changes.
+- The `rl_train.sh` resume budget bug above.
 
 ## Current Handoff (2026-09-06b, velocity-setpoint interface + scripted expert)
 
@@ -4161,3 +1825,244 @@ the course's 1.20-2.29 uses 79% of that authority.
 - `eval_flight.py` writes its JSON with `--json-output`, not `--output`.
 - `stop_all.sh` chained after other commands in one shell has killed the calling
   shell mid-sequence here. Run it on its own line.
+
+## Current Handoff (2026-09-08b, altitude bandwidth swept: the plant got better and the FLIGHT got worse)
+
+**STATE: stopped, nothing running.** `nanopilot/drone_config_80mm.py` and
+`nanopilot/rl_env.py` are back at their 2026-09-08 values -- **no flight
+behaviour changed this session**, and the revert is verified: the expert flies
+`s_curve_heights_80mm` 30/30 crossings, 3/3 episodes 10/10, lateral mean 0.11m. What landed is tooling: an MSP launch gate in
+`start.sh`, a new `scripts/start_gated.sh`, and a `--gains` sweep mode in
+`scripts/probe_alt_step.py`.
+
+### The headline, because it is counter-intuitive
+
+The 2026-09-08 handoff named the altitude-loop bandwidth as "the binding
+constraint... the plant, not the student" and said to raise
+`DRONE_ALTITUDE_HOLD_KP`/`_K` first. That was measured, and the first half is
+true: the step response improves enormously and there is no stability limit
+anywhere in a 10x gain range. **But the expert then flies the course WORSE at
+every outer gain tested, and crashes at most of them.** The gains were reverted.
+
+**Do not re-run this sweep expecting a different answer.** The open question is
+not "is the loop faster" (yes, dramatically) but "why does a faster inner loop
+hurt the cascade", and there is a concrete hypothesis below.
+
+### Measured: the PD altitude hold from Kp=30 to Kp=320
+
+`scripts/probe_alt_step.py --amplitude=0.5 --hold-s=12 --gains=...`, one flight
+per ladder (gains are read fresh every control cycle, so they can be swapped
+mid-air -- that is what `--gains` exploits). Ladder built for constant damping:
+`w_n = sqrt(s*Kp)`, `zeta = sqrt(s)*K/(2*sqrt(Kp))`, so Kp scales as r**2 and K
+as r.
+
+| Kp:K | w_n | zeta | settle | ss err | \|bias\| 0.5m step | \|bias\| 1m step |
+| --- | --- | --- | --- | --- | --- | --- |
+| **30:90** (current) | 0.47 | 0.36 | 24.4s | 0.10m | 12 | 33 |
+| 60:127 | 0.56 | 0.57 | 12.4s | 0.05m | 26 | 63 |
+| 90:156 | 0.66 | 0.65 | 9.4s | 0.03m | 42 | 93 |
+| 120:180 | 0.73 | 0.69 | 8.0s | 0.02m | 57 | 123 |
+| 180:220 | 0.88 | 0.73 | 6.2s | 0.02m | 84 | 183 |
+| 240:255 | 0.99 | 0.76 | 5.4s | 0.01m | 117 | 243 (sat 1%) |
+| 320:294 | 1.14 | 0.79 | 4.5s | 0.01m | 157 | 323 (sat 1%) |
+
+Three things in that table are worth keeping:
+
+- **There is no stability limit in this range.** zeta IMPROVES monotonically,
+  0.36 -> 0.79. The 2026-09-08 lag argument predicted damping would degrade as
+  bandwidth rose; it does the opposite. The loop is far more forgiving than
+  assumed.
+- **The real ceiling is actuator saturation, not stability.** `alt_hold_bias`
+  clips at +-200 and `TRIM_RANGE = 1.0` lets a policy command a full 1.0m
+  offset, so `Kp*TRIM_RANGE` plus the velocity term must fit inside 200 or the
+  commanded authority becomes a relay. Kp=120 is the largest rung that keeps the
+  WHOLE commanded range linear (123 pwm); Kp>=240 saturates outright. **Kp and
+  TRIM_RANGE are coupled -- raising one means lowering the other.**
+- **The old handoff's scaling rule was wrong.** "Doubling both raises bandwidth
+  1.41x at constant damping" -- doubling both raises w_n by 1.41 AND zeta by
+  1.41. Constant damping needs Kp*r**2 with K*r.
+
+Also measured: the steady-state hover offset is pure `bias/Kp`. The hold settled
+at 1.76 / 1.59 / 1.55 / 1.53m against a 1.50 setpoint at Kp=30/60/90/120 -- i.e.
+there is a residual ~8 PWM thrust bias, and Kp is what bounds it.
+
+### And yet: at Kp=120/K=180 the expert gets worse at every outer gain
+
+`gate_rollout.py --expert --episodes=3 --world=s_curve_heights_80mm`, sweeping
+`--height-gain` (Kz), on Kp=120/K=180:
+
+| Kz | crossings passed | episodes (gates/10) |
+| --- | --- | --- |
+| 0.0 | 23/27 (85%) | 8, 6, 9 -- no crashes, one timeout |
+| 0.25 | 18/25 (72%) | 5, 7, 6 -- **all crashed** |
+| 0.5 | 18/22 (82%) | 5, 7, 6 -- **all crashed** |
+| 0.75 (the tuned default) | 10/12 (83%) | 3, 4, 3 -- **2 crashed** |
+| --- | --- | --- |
+| **Kp=30/K=90, Kz=0.75 (reverted)** | **30/30 (100%)** | **10, 10, 10 -- no crashes** |
+
+The failure is always the same shape and it is NOT overshoot: on the descending
+half of the course the drone sits ABOVE the reference and will not come down.
+At Kz=0.0, gate-by-gate dz went +0.01, +0.20, -0.41, +0.15, **+0.66, +1.15,
++1.29** -- tracking tightly until the descent, then falling behind it. At Kz=0.75
+it lost the descent even earlier (dz=+0.95 at gate 3) and crashed.
+
+**The hypothesis worth testing next, and the reason Kz cannot fix it.** The
+expert commands `z_target = z_ref + Kz*(z_ref - z)`, and the env realises it as
+`setpoint + altitude*TRIM_RANGE` with `altitude` CLIPPED to [-1, 1]. The
+setpoint is frozen at `start_alt = 1.5` and `TRIM_RANGE = 1.0`, so the reachable
+band is exactly 0.5-2.5m while the course spans 1.20-2.29. At gate_07 (z=2.29)
+the feed-forward term alone is +0.79 of the available 1.0, so **any Kz
+correction on the high gates is clipped away** -- which is why raising Kz makes
+things worse rather than better, and why Kz=0 is the best of a bad set. Raising
+Kp does not add authority here; it only makes the drone track a command that is
+already saturated. The lever to try is `TRIM_RANGE` (still un-swept, flagged as
+such since 2026-09-08), bounded by `Kp*TRIM_RANGE <~ 200`.
+
+### FIXED: start.sh handed over MSP-deaf boards (this was the day's real bug)
+
+BetaFlight SITL was measured aborting at launch on **~50% of attempts** today
+(6 isolated launches: 3 died outright). `start_betaflight`'s health test was
+`kill -0` after 2s -- process-alive, not MSP-alive -- so a board that cleared
+that check and was still deaf got handed over, and every flight then died with
+`BetaFlight lost arming`. Its log said so plainly and nothing acted on it:
+
+    Features: MSP_FEATURE_CONFIG returned 0 bytes — skipping airmode check
+    Status: MSP_STATUS_EX returned 0 bytes
+
+`start_betaflight` now calls a new `betaflight_msp_alive` helper and retries (8
+attempts) until MSP actually ANSWERS. Verified: a launch that survives startup
+answers MSP every time (`status=772`), so "deaf board" and "SITL died at
+startup" are the same failure -- **this is the root cause of the "three
+consecutive rebuilds all produced a board that never armed" sessions.**
+
+`scripts/start_gated.sh` wraps the whole stack in the same gate:
+
+    GZ_HEADLESS=1 GZ_WORLD=s_curve_heights_80mm \
+      bash scripts/start_gated.sh --no-manage --airframe=80mm
+
+It stops, launches, waits for `STACK_READY`, settles 25s (the documented
+`imu=False` readiness race), runs the MSP check, and rebuilds on failure; exits
+0 with the stack up, 1 if every attempt failed. Since both fixes went in, every
+stack has come up healthy on attempt 1.
+
+**Its own bug is worth knowing about**, because it looked exactly like a launch
+failure: `start.sh` runs `stop_all.sh` from its EXIT trap, so a dying `start.sh`
+lands a SIGKILL some seconds AFTER you asked it to stop. The first version slept
+2s between attempts and the previous attempt's trap then killed the stack the
+next attempt had just built -- the log read `STACK_READY` immediately followed by
+`Killed: 9`. `wait_quiet()` now polls until BetaFlight, `gz sim` and `start.sh`
+are all actually gone.
+
+### New: probe_alt_step.py --gains
+
+Sweeps several `KP:K` pairs against ONE stack and ONE takeoff -- a stack cycle
+costs ~40s and a takeoff ~25s against ~40s for a whole 3-leg gain pair. It also
+now reports `|bias|max` and the saturated fraction of each leg, because a clean
+step that spent its rise pinned at the +-200 clip is not evidence the gains are
+usable.
+
+### Tooling gotchas that cost real time today
+
+- **Never pipe a nanopilot flight script into `tail`/`head`/`grep`.** Two
+  separate ways it bites: (1) `gz_camera_worker` is a subprocess that INHERITS
+  stdout, so when the parent dies the pipe never sees EOF and the command hangs
+  forever with zero output; (2) the worker logs a line per second, so `2>&1 |
+  tail -N` fills the window with camera spam and discards the actual results.
+  Redirect stdout and stderr to separate FILES.
+- **Use `python -u` for anything long-running.** Python block-buffers stdout to
+  a file, so a crash loses the entire buffer -- a probe that died on a real
+  traceback looked like it produced nothing at all.
+- **`gate_rollout.py` takes `--world` and OVERWRITES `GZ_WORLD` from it**
+  (default `slalom_gates_80mm`). `eval_flight.py` is the opposite: no `--world`
+  flag, reads `GZ_WORLD`. Passing `GZ_WORLD=... gate_rollout.py` without
+  `--world` silently flies the heights world against SLALOM gate coordinates.
+
+### If the gains are ever raised, rl_env needs this one-line companion
+
+At Kp=120 every takeoff burned the full 15s timeout with `Timed out arresting
+climb after takeoff`. Cause: through the `direct_thrust` ramp the hold setpoint
+is re-anchored to the CURRENT height every cycle, so at cutoff it sits at the
+liftoff height, BELOW `min_start_alt` (0.8). That was harmless while the hold
+was soft -- the drone coasted up through it on momentum -- but a stiff hold wins
+and hauls it straight back down, so `z >= min_start_alt` never becomes true.
+Fix, at the top of `_arrest_climb` (reverted with the gains, re-apply if needed):
+
+    if getattr(self._env, "altitude_hold_kp", 0.0) > 0.0:
+        self._env.set_altitude_setpoint(self.start_alt)
+
+Verified: takeoff then succeeded first attempt with no retries.
+
+### ROOT CAUSE FOUND: the bench probe cannot see the failure, because it
+### measures a STATIONARY drone
+
+Instrumented `GateExpert.act` to record `z_ref` and the PRE-clip altitude
+command into `gate_rollout.py --trace-output`, then flew 2 episodes at each
+gain. `alt_cmd` alone is post-clip and cannot tell "asked for 0.9" from "asked
+for 1.8", which is why this needed new instrumentation.
+
+Reconstructing the env's OWN PD term (`-Kp*(z - z_target) - K*vz`) from the
+traces settles it:
+
+| | env PD bias, \|max\| | saturated | \|z-z_ref\| mean / max |
+| --- | --- | --- | --- |
+| Kp=30/K=90 (good, 10/10 x2) | 98-150 pwm | **0.0%** | 0.23-0.36 / 0.63-0.96m |
+| Kp=120/K=180 (crashed 8, 5) | **832-941 pwm** | **26.8% / 51.5%** | 0.32-0.54 / 1.69-2.12m |
+
+At Kp=120 the altitude hold spends **a quarter to a half of every episode
+pinned at the +-200 clip**. A saturated proportional loop is a relay, not a
+regulator, so the higher gains destroy the very regulation they were meant to
+buy. The expert's own command clipping (4.9-12.6% vs 0-1.6%) is a SYMPTOM, not
+the cause: `alt_raw` only reaches 2.09 because the tracking error reached 2.1m
+first.
+
+**Why the sweep missed it, and this is the lesson.** `probe_alt_step.py` holds
+the drone STATIONARY and steps a fixed setpoint, so `vz` stays near zero and the
+velocity term never loads the clip -- it reported 0% saturation at every gain up
+to Kp=240. In flight the velocity term dominates the position term **73-76% of
+steps at BOTH gain settings**, so the clip is governed by `vz`, not by position
+error. Measured `|vz|` on this course: median 0.40, p90 0.85, p99 1.27, max
+1.58 m/s.
+
+**The correct sizing rule is therefore `K * vz_p99 + Kp * err_max < 200`, using
+IN-FLIGHT vz** -- not the bench rule `Kp*TRIM_RANGE < 200` that the step
+response suggested. The velocity term alone saturates at `|vz| = 200/K`:
+
+| K | vz that saturates | % of flight above it |
+| --- | --- | --- |
+| **90 (current)** | **2.22 m/s** | **0.0%** |
+| 127 | 1.57 | 0.3% |
+| 156 | 1.28 | 1.1% |
+| 180 | 1.11 | 2.8% |
+| 255 | 0.78 | 13.5% |
+
+K=90 is already sized so that this course never saturates it. That is why it
+works, and it was not luck -- it leaves the full +-200 for the position term.
+
+**Consequence for any future bandwidth work:** raising `Kp` REQUIRES either
+raising the `+-200` clip on `alt_hold_bias` (in `drone_gym.py`, and then the
+`hover_throttle +- range` headroom becomes the limit) or accepting a lower `K`,
+which costs damping. Bandwidth on this plant is clip-limited, not
+stability-limited. **And never size these gains from `probe_alt_step.py`
+alone** -- it cannot generate the vz that actually sets the constraint.
+
+### Do this next
+
+1. **Do NOT sweep TRIM_RANGE on the strength of the clipping argument.** It was
+   investigated and rejected: the known-GOOD Kp=30 run clips the expert command
+   as often as the bad ones (1 crossing in 30), and the Kp=120/Kz=0.0 run never
+   clipped at all yet still failed. Per-gate headroom IS tight at the high gates
+   (gate_07 has 0.21 of command left after the feed-forward, i.e. only 0.28m of
+   correctable error at Kz=0.75), so it is worth knowing for COURSE DESIGN, but
+   it is not what limits the current plant.
+2. If more altitude bandwidth is ever genuinely needed, the first move is to
+   raise the `+-200` clip in `drone_gym.py`, not `Kp` -- and re-measure
+   saturation IN FLIGHT with `--trace-output`, not on the bench.
+2. If a harder height course is still wanted after that, revisit Kp with the
+   knowledge that stability is not the constraint -- and re-sweep Kz AND
+   TRIM_RANGE together, since all three interact.
+3. Everything from the 2026-09-08 list still stands: re-validate
+   `bc_dagger1_scurve` on the flat course if belt and braces is wanted, and
+   65mm has still never been re-tested airborne on the tamed pitch/roll PIDs or
+   the corrected yaw scaling.
+4. `models/bc_dagger1_heights.pth` was NOT re-evaluated this session. Nothing
+   affecting it changed (the gains are reverted), so it should still be 10/10.

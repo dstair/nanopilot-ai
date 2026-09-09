@@ -171,7 +171,8 @@ def main():
     crossings = []
     traces = []
     for ep in range(args.episodes):
-        ep_trace = {"t": [], "z": [], "vz": [], "alt_cmd": []}
+        ep_trace = {"t": [], "z": [], "vz": [], "alt_cmd": [],
+                    "z_ref": [], "alt_raw": [], "gate_idx": []}
         t0 = time.time()
         obs, _ = gate_env.reset(seed=1000 + ep)
         t0 = time.time()
@@ -211,6 +212,13 @@ def main():
             ep_trace["alt_cmd"].append(
                 round(float(applied[3]), 6) if applied is not None and len(applied) > 3 else 0.0
             )
+            # The expert's own view: what height it was aiming for and what it
+            # asked for BEFORE np.clip. alt_cmd above is post-clip, so on its
+            # own it cannot distinguish "asked for 0.9" from "asked for 1.8".
+            dbg = getattr(expert, "last_debug", None) if args.expert else None
+            ep_trace["z_ref"].append(round(dbg["z_ref"], 4) if dbg else 0.0)
+            ep_trace["alt_raw"].append(round(dbg["alt_raw"], 6) if dbg else 0.0)
+            ep_trace["gate_idx"].append(dbg["gate_idx"] if dbg else -1)
 
             lx, ly, z = gate_env._gate_local(gate, pos)
             d = gate_env._gate_dist(gate, pos)

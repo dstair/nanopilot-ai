@@ -252,6 +252,22 @@ class GateExpert:
             height_ff + self.height_gain * (z_ref - pos[2])
         ) / self.altitude_trim_range
 
+        # Purely observational: the altitude axis is the only one whose command
+        # can be clipped by the trim range rather than by the plant, and the
+        # crossing-instant logs cannot show that because z_ref == gate_z there.
+        # Recording the PRE-clip value is the whole point -- once np.clip has
+        # run there is no way to tell "asked for 0.9" from "asked for 1.8".
+        self.last_debug = {
+            "gate_idx": gate_idx,
+            "lx": lx,
+            "z": float(pos[2]),
+            "z_ref": z_ref,
+            "setpoint": None if setpoint is None else float(setpoint),
+            "height_ff": height_ff,
+            "alt_raw": float(altitude),
+            "alt_clipped": float(min(1.0, max(-1.0, altitude))),
+        }
+
         return np.clip(
             np.array([steering, throttle, roll, altitude], dtype=np.float32), -1.0, 1.0
         )

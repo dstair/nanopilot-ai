@@ -110,26 +110,48 @@ echo "Starting BetaFlight SITL: $BETAFLIGHT_BIN (log: $BF_LOG)..."
 
 # Reusable launcher — called again after a CLI eeprom save so the running BF
 # loads fresh values from disk and comes up with a clean arming-flag state.
+# True only if BetaFlight answers a real MSP request. Distinguishes a live board
+# from one that is merely running with an open socket -- see start_betaflight.
+betaflight_msp_alive() {
+    (cd "$PROJECT_DIR" && uv run --env-file .env python - <<'PYEOF' >/dev/null 2>&1
+import sys
+sys.path.insert(0, "nanopilot")
+from utils.betaflight import MSPClient
+sys.exit(0 if MSPClient().query_status(timeout=2.0)[0] is not None else 1)
+PYEOF
+    )
+}
+
 start_betaflight() {
     # BetaFlight SITL on macOS ARM64 intermittently aborts during TCP serial
     # init (heap corruption in openSerialPort/stream_initAddress). Random per
     # launch, so retry generously.
-    local max_attempts=5
+    #
+    # `kill -0` is NOT a sufficient test. A launch can clear it and still be
+    # MSP-deaf: the process is alive, port 5761 accepts connections, and every
+    # request then times out. That board never arms, so start.sh used to hand
+    # over a stack whose every flight died with "BetaFlight lost arming" --
+    # measured at a ~50% per-launch failure rate on 2026-09-08, and the reason
+    # for the "three consecutive rebuilds all produced a dead board" sessions.
+    # Verify MSP actually ANSWERS before accepting a launch.
+    local max_attempts=8
     for attempt in $(seq 1 "$max_attempts"); do
         > "$BF_LOG"
         # Removed gstdbuf to avoid DYLD_INSERT_LIBRARIES SIGTRAP on Apple Silicon
         "$BETAFLIGHT_BIN" > "$BF_LOG" 2>&1 &
         BF_PID=$!
         sleep 2
-        if kill -0 "$BF_PID" 2>/dev/null; then
-            echo "BetaFlight SITL running (PID $BF_PID)."
+        if kill -0 "$BF_PID" 2>/dev/null && betaflight_msp_alive; then
+            echo "BetaFlight SITL running (PID $BF_PID), MSP responding."
             return 0
         fi
+        kill -9 "$BF_PID" 2>/dev/null
+        wait "$BF_PID" 2>/dev/null
         if [ "$attempt" -lt "$max_attempts" ]; then
-            echo "BetaFlight crashed on attempt $attempt, retrying..."
+            echo "BetaFlight dead or MSP-deaf on attempt $attempt, retrying..."
             sleep 2
         else
-            echo "ERROR: BetaFlight SITL died on all $max_attempts attempts. Check $BF_LOG"
+            echo "ERROR: BetaFlight SITL never came up MSP-responsive in $max_attempts attempts. Check $BF_LOG"
             exit 1
         fi
     done
