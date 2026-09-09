@@ -189,7 +189,31 @@ DRONE_ALTITUDE_HOLD_KP = 30.0
 # 0.1 deadband the shaped command spans +-0.63, so this is +-0.63m of authority
 # at 1.0. The command trims the target height rather than adding thrust, which
 # is what stops a constant command from integrating.
-DRONE_ALTITUDE_TRIM_RANGE = 1.0
+#
+# RAISED 1.0 -> 1.6 on 2026-09-09 for the landing task, and the value is
+# arithmetic, not taste: the hold setpoint is frozen at start_alt = 1.5 and the
+# reachable band is setpoint +- TRIM_RANGE, so at 1.0 the lowest height a policy
+# can ASK FOR is 0.5m. Touchdown is simply not in the action space. 1.6 puts the
+# floor at -0.1m, which is below ground with enough margin that the drone
+# arrives rather than approaching asymptotically (the axis commands a height,
+# never a rate, so descent speed is set entirely by how far below ground the
+# target sits -- measured 2026-09-09: 8.6s to touchdown at 0.02 m/s).
+#
+# Affordable against the +-200 clip on alt_hold_bias, using the IN-FLIGHT
+# sizing rule from 2026-09-08b (K*vz + Kp*err < 200, never bench vz):
+#   position, worst case   Kp * TRIM_RANGE = 30 * 1.6 =  48 pwm
+#   descent at 0.4 m/s     K  * vz         = 90 * 0.4 =  36 pwm
+# ~84 of 200. It would NOT be affordable at the Kp=120/K=180 gains rejected on
+# 2026-09-08b (192 + 72 = 264, saturated), which is another reason those stay
+# reverted. Measured landing legs peaked at 49 pwm with 0% saturation.
+#
+# COST, and it is real: this rescales what the altitude axis MEANS. A scripted
+# expert is unaffected (it reads the range from the env and divides by it, so
+# alt*TRIM_RANGE and therefore z_target are unchanged), but every checkpoint
+# trained at 1.0 now commands 1.6x the height offset it intends. Tubs and
+# models do not cross this change -- same trap as the 2026-09-06b interface
+# change. See the Stage 3 handoff for what was re-validated.
+DRONE_ALTITUDE_TRIM_RANGE = 1.6
 
 # ---- Velocity Control Mode ----
 # Changes what the learned policy has to output. With this ON, pitch/roll are

@@ -373,7 +373,7 @@ External paths that matter:
 | `DRONE_HOVER_THROTTLE` | 1480 | re-measured after taming the BF PIDs |
 | `DRONE_ALTITUDE_HOLD_K` | 90.0 | velocity term |
 | `DRONE_ALTITUDE_HOLD_KP` | 30.0 | **position term — this is what makes the plant safe** |
-| `DRONE_ALTITUDE_TRIM_RANGE` | 1.0 | metres of setpoint authority in-deadband; still un-swept |
+| `DRONE_ALTITUDE_TRIM_RANGE` | **1.6** | metres of setpoint authority. Raised from 1.0 on 2026-09-09 so touchdown is in the action space; gate courses re-validated |
 | `DRONE_ALTITUDE_HOLD_DEADBAND` | 0.1 | outside it the command is direct thrust |
 | `DRONE_PITCH_THROTTLE_FEEDFORWARD` | 2.0 | swept airborne; higher values climb |
 | `DRONE_YAW_THROTTLE_FEEDFORWARD` | 0.0 | correct — yaw-induced thrust is now ~0.3 PWM |
@@ -2537,6 +2537,93 @@ meaning the same height, and `bc_dagger1_heights` (trained at 1.0) will be
 commanding 1.6x the height offset it intends. **Expect the existing student to
 regress and require retraining; that cost was accepted when option C was
 chosen.** The gate to check is the EXPERT at 10/10, not the student.
+
+### STAGE 3 RESULT (2026-09-09): TRIM_RANGE = 1.6 is in config, and the gate
+### courses did NOT regress -- the expert improved slightly, and so did the student
+
+**STATE: stopped, nothing running.** `DRONE_ALTITUDE_TRIM_RANGE` is **1.6** in
+`drone_config_80mm.py`. 65mm does not set it and is unaffected. Nothing else
+changed.
+
+#### Why the gate courses were expected to be unaffected, and were
+
+A scripted expert is invariant to this constant, and the algebra says so:
+`GateExpert` computes `alt = (...) / TRIM_RANGE` and the env applies
+`z_target = setpoint + alt * TRIM_RANGE`, so `z_target` is IDENTICAL at any
+trim range. The only thing that changes is where the command CLIPS. That is a
+prediction, and it held:
+
+| | 2026-09-08 baseline (trim 1.0) | **Stage 3 (trim 1.6)** |
+| --- | --- | --- |
+| crossings passed | 30/30 | **50/50 (5/5 episodes 10/10)** |
+| lateral offset mean | 0.11m | **0.10m** (max 0.38m, window 0.9m) |
+| height error at crossing | 0.34m | **0.36m** mean, 0.73m max |
+| misses lateral / height | 0 / 0 | **0 / 0** |
+| expert command clipped | 1 crossing in 30 | **0 of 2793 samples** |
+| env PD bias | 98-150 pwm, 0% saturated | **153 pwm, 0% saturated** |
+
+The clipping line is the whole change, and it is measurable: the expert's peak
+command is **1.06m of height offset**. At TRIM_RANGE=1.0 that reads |alt|=1.063
+and gets clipped; at 1.6 it reads 0.665 and does not. So the gate courses got
+marginally MORE authority, not less, which is the opposite of a regression.
+
+#### The student did not regress either, and the reason matters
+
+`bc_dagger1_heights` (trained at trim 1.0) on `s_curve_heights_80mm`:
+
+| | trim 1.0 (2026-09-08) | trim 1.6 |
+| --- | --- | --- |
+| episodes | 5/5 completed, 10/10 gates | **5/5 completed, 10/10 gates** |
+| crossing height err | 0.254m mean, 0.465 max | **0.235m mean, 0.490 max** |
+
+**Do not read this as "the student is fine at 1.6".** It is commanding 1.6x the
+height offset it means to. Solving for where that settles:
+
+    z_ss = (2.8 * z_ref - 0.6 * setpoint) / 2.2 = 1.273*z_ref - 0.273*setpoint
+
+i.e. it overshoots every height excursion by ~27%. What happened is that the
+1.6x amplification also acts as extra loop gain, and on this course it cancels
+more TRACKING LAG than the overshoot costs -- so the mean improved (0.254 ->
+0.235) while the extremes got slightly worse (0.465 -> 0.490), exactly as that
+formula predicts. It survives because this course's excursions (+-0.55m about
+the setpoint) are small enough that a 27% overshoot stays inside the pass
+window. A course with larger excursions would not be so forgiving.
+
+**Any model to be relied on at trim 1.6 should be retrained at trim 1.6.** Tubs
+do not cross this change either -- the altitude label is in units of
+TRIM_RANGE, so a pre-1.6 tub means something different from a post-1.6 one.
+Same trap as the 2026-09-06b interface change. `tub_22`..`tub_25` and
+`bc_dagger1_heights` / `bc_dagger1_scurve` are all pre-1.6.
+
+#### The landing task now works from config alone
+
+`eval_flight.py --expert` on `landing_target_80mm`, **no `--trim-range`
+override**: 5/5 completed, mean 18.64s, touchdown -0.031 m/s, **0.043m from the
+pad centre**, cross-track 0.011m. Identical to the Stage 2 run that used the
+override (18.60s, 0.045m), which also validates the override mechanism itself.
+
+#### Not re-run, and why
+
+`bc_dagger1_scurve` on the flat `s_curve_gates_80mm` was not re-flown. On a
+flat course `z_ref == setpoint`, so the feed-forward term is identically zero
+and the only command is `Kz * (z_ref - z)` acting on the hold's ~0.1m residual;
+the 1.6x amplification makes that an effective Kz of 1.2 against a command of a
+few centimetres. The heights course is strictly the harder test of the same
+mechanism and it passed. Cheap to check if belt and braces is wanted.
+
+#### Stage 3 is complete. Next is Stage 4
+
+Collect with `rl_collect.py --expert` (~40 episodes), train, then DAgger.
+Two things that need doing FIRST, because neither collector knows about this
+task yet:
+
+1. **`rl_collect.py` and `dagger_collect.py` both build a `GateExpert` against
+   a gate world.** They need the `LineExpert` path, the same way `eval_flight`
+   got `--expert`. `GateChaseEnv` also assumes gates exist.
+2. Judge the result by `eval_flight` only, never by val loss (2026-09-07b).
+
+Expect the established pattern: the expert-only student flies on-manifold and
+fails off it, and one DAgger round fixes it.
 
 ### Two things expected to go wrong
 
