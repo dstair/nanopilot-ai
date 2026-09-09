@@ -319,6 +319,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `worlds/s_curve_heights_80mm.sdf` | 10-gate varied-height S-curve; per-gate pass window. **Current benchmark** |
 | `worlds/s_curve_gates_80mm.sdf` | 10-gate flat S-curve; same x/y/yaw, so height is the only difference |
 | `worlds/slalom_gates_80mm.sdf` | retired 3-gate slalom; kept for historical comparison |
+| `worlds/landing_target_80mm.sdf` | takeoff -> 20m guidance line -> landing pad at (20,0). **Next course**; see the 2026-09-09 plan |
 | `worlds/*_80mm.sdf` | 80mm worlds |
 | `worlds/drone_course_65mm.sdf` | retained 65mm Air65 world |
 
@@ -2066,3 +2067,147 @@ alone** -- it cannot generate the vz that actually sets the constraint.
    the corrected yaw scaling.
 4. `models/bc_dagger1_heights.pth` was NOT re-evaluated this session. Nothing
    affecting it changed (the gains are reverted), so it should still be 10/10.
+
+## Current Handoff (2026-09-09, PLAN: takeoff -> line-follow -> land on target)
+
+**STATE: stopped, nothing running. Nothing implemented yet -- this section is
+an agreed plan, not a result.** The previous handoff (2026-09-08b) still stands
+in full; nothing in it is superseded.
+
+**Decisions already made, do not re-litigate:**
+
+1. **Vertical authority comes from raising `DRONE_ALTITUDE_TRIM_RANGE`
+   (1.0 -> 1.6)**, NOT from a 5th model output, NOT from making `altitude` a
+   climb-rate, and NOT from leaving takeoff/landing scripted. See "the four
+   options" below for what was rejected and why.
+2. **Scripted expert -> BC -> DAgger, not RL.** `rl_train.py`/`rl_env.py` stay
+   retired. The record is decisive: the best RL teacher ever produced
+   (`ppo_gates_v4`) reached 10/10 and the scripted `GateExpert` MATCHED it with
+   zero training time and no checkpoint to pick, while every attempt to distil
+   a student from an RL teacher failed. "Fly a line, then descend over a pad"
+   is a pure function of privileged state, so it is an even better fit for a
+   scripted expert than the gate courses were. RL would only earn its place if
+   the landing FLARE were to be discovered rather than specified (terminal
+   reward on touchdown velocity); that was considered and deliberately not
+   chosen.
+
+### Most of this task already exists
+
+`worlds/landing_target_80mm.sdf` is already the described course. Measured from
+the SDF:
+
+| model | pose | size |
+| --- | --- | --- |
+| `start_platform` | (0, 0, 0.01) | 2 x 2 |
+| `guidance_line` | (10, 0, 0.01) | 20 x 0.2 (runs x=0 -> x=20) |
+| `landing_pad` | (20, 0, 0.01) | 0.5 x 0.5 box, 1.5m radius visual |
+
+`eval_flight.py` also already carries the scaffolding from the 2026-08-07 BC
+era: `parse_world` returns `(gates, pad_xy)`, `detect_task` returns `"line"`
+when a pad exists and there are no gates, `episode_metrics` computes
+`along_track_max_m` / `cross_track_mean_m` / `cross_track_max_m` /
+`final_dist_to_pad_m`, and `--pad-radius` (default 1.0) exists.
+
+**All of it predates the velocity-setpoint interface (2026-09-06b), so treat it
+as unvalidated scaffolding, not as working code.**
+
+### Blocker 1: the action interface cannot express a takeoff or a landing
+
+Under `DRONE_VELOCITY_CONTROL`, `altitude` is a height TRIM about a setpoint
+frozen at `start_alt`, so `z_target = setpoint + altitude * TRIM_RANGE` and the
+reachable band is **0.5m .. 2.5m** at `start_alt=1.5, TRIM_RANGE=1.0`. The
+ground is at 0. **At full negative stick the policy can still only ask for
+0.5m; touchdown is not in its action space.** Takeoff and landing are today
+scripted `direct_thrust` ramps that bypass the hold entirely, and
+`direct_thrust` is not one of the policy's four outputs.
+
+### Blocker 2: the scorer counts a landing as a crash
+
+`eval_flight.py` ends an episode `"crashed"` at `pos[2] < crash_z` (default
+0.12), and the `"line"` task already reports `"completed"` on HORIZONTAL
+proximity to the pad alone (`fly_episode`, the `near_pad` branch) without ever
+descending. So today a perfect landing scores as a crash and a fly-over scores
+as a success. Nothing downstream can be judged until this is fixed.
+
+### Blocker 3: there is no expert for this task
+
+`GateExpert` is gate-specific -- pure pursuit along a gate centreline with
+`gate_idx` tracking. A `LineExpert` is new, but small.
+
+### The four options, and why C
+
+| | approach | verdict |
+| --- | --- | --- |
+| A | 5th output = explicit thrust | REJECTED: breaks the 4-output model, invalidates every tub and checkpoint |
+| B | make `altitude` a climb-RATE, integrating into the setpoint | REJECTED: a real interface change, same risk class as 2026-09-06b |
+| **C** | **raise `TRIM_RANGE` until the band reaches ground** | **CHOSEN** |
+| D | keep takeoff/landing scripted, learn only the line | REJECTED: cheapest but tests the least |
+
+**`TRIM_RANGE = 1.6` puts the reachable floor at -0.1m** (ground reachable with
+margin) and is affordable against the `+-200` clip on `alt_hold_bias`, using
+the sizing rule established on 2026-09-08b (`K*vz + Kp*err < 200`, with
+IN-FLIGHT vz, never bench vz):
+
+    position term, worst case:  Kp * TRIM_RANGE = 30 * 1.6 = 48 pwm
+    descent at 0.4 m/s:         K  * vz         = 90 * 0.4 = 36 pwm
+    total                                        ~84 of 200
+
+That is comfortable at the CURRENT gains. It would NOT be comfortable at the
+Kp=120/K=180 gains rejected on 2026-09-08b (192 + 72 = 264, saturated) -- which
+is another reason those gains stay reverted.
+
+**Cost to own:** raising `TRIM_RANGE` rescales what the altitude axis MEANS, so
+every existing tub and checkpoint goes stale for training on this axis. That is
+acceptable because this course needs fresh data anyway, but it is exactly the
+"do not mix tubs across an interface change" trap -- do not aggregate
+pre-1.6 tubs with post-1.6 ones.
+
+### Staged plan
+
+**Stage 0 -- probes. This is the "learn how to change altitude well" payload.**
+Nothing trains until these are measured:
+- `probe_alt_step.py` near the ground (0.3-0.8m): does the hold behave the same
+  low down as at 1.5m?
+- **A new descent-rate probe.** Command increasing descent rates and find where
+  the PD term saturates and where the drone stops tracking. This is the direct
+  extension of the 2026-09-08b saturation finding and it is the number that
+  sizes the landing. The descent is the one phase that deliberately runs `vz`
+  up, and `vz` is what eats the clip budget.
+- Confirm there is no ground effect in the sim (the plugin has no vertical
+  drag, so probably none -- confirm rather than assume).
+
+**Stage 1 -- make the task scorable.** Add a `"land"` task to `eval_flight.py`:
+success = inside the pad radius AND `z < touchdown_z` AND `|vz| < settle_vz`,
+scored distinctly from `"crashed"`. Report touchdown velocity and pad offset in
+the metrics. Nothing downstream is meaningful until this exists.
+
+**Stage 2 -- write `LineExpert` and prove it flies.** Pure pursuit along the
+line to the pad, then a proportional descent once inside the pad radius. Same
+shape as `GateExpert`, reachable through `act_from_telemetry`. **Gate: >=90%
+clean landings over 10 episodes before collecting anything.** The expert is the
+ceiling; a mediocre expert cannot be fixed downstream.
+
+**Stage 3 -- set `TRIM_RANGE = 1.6` and RE-VALIDATE THE GATE COURSES.** This
+changes the plant for every course, not just the new one. Re-run
+`gate_rollout.py --expert --world=s_curve_heights_80mm` and confirm it is still
+10/10 before going further. Non-negotiable checkpoint: if the gate courses
+regress, stop and reconsider, because `bc_dagger1_heights` depends on that
+plant.
+
+**Stage 4 -- collect, distil, DAgger.** `rl_collect.py --expert` (~40
+episodes), `torch_train.py`, then `eval_flight`. Expect the established
+pattern: the expert-only student flies on-manifold and fails off it, and one
+DAgger round fixes it. **Judge by `eval_flight` only, never by val loss** --
+DAgger val loss measures the PREVIOUS policy's mistakes (2026-09-07b).
+
+### Two things expected to go wrong
+
+- **The descent eats the clip budget.** It is the only phase that deliberately
+  builds `vz`. If landings turn unreliable, check `alt_hold_bias` saturation in
+  a `--trace-output` run BEFORE touching any gain -- that is the mistake made
+  on 2026-09-08.
+- **The label distribution is badly imbalanced**: a long cruise and a brief
+  descent. The landing may need over-weighting or the student will smooth it
+  away. Note `TRAIN_LOSS_WEIGHTS` is uniform `[1,1,1,1]` and the standing advice
+  is not to re-tune it without flight data -- this task may be the first real
+  reason to.
