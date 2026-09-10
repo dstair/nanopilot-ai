@@ -718,6 +718,7 @@ def evaluate(cfg, args):
             approach_gain=args.approach_gain,
             descend_radius=args.descend_radius,
             land_radius=args.land_radius,
+            flare_alt=args.flare_alt,
             ground_target=args.ground_target,
         )
         print(
@@ -854,6 +855,11 @@ def main():
                              "the camera -- see line_expert's docstring")
     parser.add_argument("--land-radius", type=float, default=0.5,
                         help="--expert: full-down command inside this radius (m)")
+    parser.add_argument("--flare-alt", type=float, default=-0.1,
+                        help="--expert: floor on the glide -- the reference "
+                             "may not go below this until the drone is within "
+                             "--land-radius of the pad. Set equal to "
+                             "--ground-target to disable the floor")
     parser.add_argument("--ground-target", type=float, default=-0.1,
                         help="--expert: height reference at the pad (m). Below "
                              "ground on purpose -- aiming at 0.0 approaches "

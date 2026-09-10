@@ -34,29 +34,30 @@ Three things about the height law are load-bearing:
     label a drone that has drifted back off the pad with "climb and go round"
     rather than with whatever the last phase happened to be.
 
-  * **The glide stops at `flare_alt` (0.8m) and the last 0.8m is flown by the
-    PLANT, not by the reference.** Inside `land_radius` the command saturates
-    at -1 and the hold simply drives toward `ground_target`; because a
-    terminal descent settles at `vz = (Kp/K) * error = error/3`, that is a
-    PROPORTIONAL descent -- 0.3 m/s at 0.8m, 0.05 m/s at touchdown -- which
-    Stage 0 measured landing at 0.02 m/s. It is soft by construction and
-    needs no tuning. The glide's only job is to deliver the drone over the
-    pad, at 0.8m, without much vertical momentum.
+  * **The last metre is flown by the PLANT, not by the reference, and that is
+    why touchdown needs no tuning.** Near the ground the command saturates at
+    -1, so the effective target is pinned at `setpoint - TRIM_RANGE` and the
+    hold simply drives toward it. Because a terminal descent settles where the
+    PD balances -- `vz = (Kp/K) * error = error/3` -- that is a PROPORTIONAL
+    descent, and it lands at -0.03 m/s on its own.
 
-    Getting `flare_alt` wrong in either direction was measured. Without a
-    floor at all, the reference is already at 0.145m while the drone is still
-    1.65m from the pad, so it lands short at cruise speed (1.7 m/s
-    horizontally, `skidded`/`crashed` 4 for 4). At 0.35m the drone reaches the
-    pad correctly but arrives with 0.4-0.5 m/s of momentum built during a
-    1.15m glide, and the PD cannot shed it in the remaining 0.35m: touchdown
-    -0.32 to -0.56 m/s. At 0.8m the glide only has to lose 0.7m over 7.5m of
-    travel, so it arrives slow.
+    The same fact kills the obvious "safety" additions, and both were tried.
+    A RATE LIMIT written into the reference is simply discarded by the clip.
+    A FLARE FLOOR (`flare_alt`, kept as a parameter but disabled by default)
+    holds the glide above the ground until the drone is over the pad; it was
+    added when the expert was landing 1.8m short at 0.5 m/s, and it did fix
+    that -- but the real cause was the `PoseTracker` phantom-zero vz, which
+    had removed the altitude damper. With that fixed, all three settings land
+    100%, and the floor only costs data:
 
-    A RATE LIMIT on the reference was tried instead and does not work, for a
-    reason worth remembering: near the ground the command is saturated at -1,
-    so the effective target is pinned at `setpoint - TRIM_RANGE` and the
-    expert has no authority to modulate the descent at all. Anything clever
-    written into the reference there is simply discarded by the clip.
+        flare_alt   duration   pad out of frame   collector pad offset
+          -0.1       17.9s          3.6%              0.058-0.067m
+           0.35      19.1s          9.9%              0.022-0.027m
+           0.8       21.1s         ~36%               0.062-0.065m
+
+    Out-of-frame approach data is what broke the 2026-09-06b students, and
+    every offset here is 15x inside the 1.0m scoring radius, so the floor is
+    off. Raise it only if a course genuinely needs the margin.
 
   * **The ramp SATURATES at `land_radius`, it does not taper to the target.**
     A reference that only reaches the ground target as d -> 0 never lands: the
@@ -137,7 +138,7 @@ class LineExpert:
         approach_gain=0.6,
         descend_radius=8.0,
         land_radius=0.5,
-        flare_alt=0.8,
+        flare_alt=-0.1,
         ground_target=-0.1,
         hold_kp=30.0,
         hold_k=90.0,
@@ -164,9 +165,11 @@ class LineExpert:
         self.approach_gain = float(approach_gain)
         self.descend_radius = float(descend_radius)
         self.land_radius = float(land_radius)
-        # Floor on the glide: the reference may not go below this until the
-        # drone is within land_radius of the pad. Pairs with _rate_limit --
-        # see the module docstring, neither works without the other.
+        # Optional floor on the glide: the reference may not go below this
+        # until the drone is within land_radius of the pad. DISABLED by
+        # default (equal to ground_target), because the failure it guards
+        # against turned out to be the PoseTracker vz bug -- see the module
+        # docstring. Raise it to buy margin at the cost of data quality.
         self.flare_alt = float(flare_alt)
         self.ground_target = float(ground_target)
         # Plant gains, only used to reason about descent rate (see the

@@ -438,6 +438,9 @@ hold — i.e. the only ones safe to train on today):
 | `data/tub_23_26-09-07` | 19,505 | `s_curve_gates_80mm` (flat) | DAgger round 1 |
 | `data/tub_24_26-09-07` | 22,230 | `s_curve_heights_80mm` | expert rollouts, 40/40 kept, all 10/10 |
 | `data/tub_25_26-09-08` | 18,563 | `s_curve_heights_80mm` | DAgger round 1 |
+| `data/tub_34_26-09-10` | 14,940 | `landing_target_80mm` | expert landings, **40/40 kept** |
+| `data/tub_35_26-09-10` | 10,473 | `landing_target_80mm` | DAgger round 1 (25 eps, all flyaway, all kept) |
+| `data/tub_36_26-09-10` | 2,238 | `landing_target_80mm` | DAgger round 2 seed, 5 eps by `bc_dagger1_land` |
 
 Current models:
 
@@ -2737,6 +2740,129 @@ Collection verified: **4/4 kept, all `completed`, touchdown -0.031 m/s,
    out of frame (85 deg depression at 0.8m over the pad, against +-64 deg of
    vertical FOV). Worth comparing against a lower flare now that the damper
    works, on DATA quality rather than on landing quality -- both land.
+
+### STAGE 4 RESULT (2026-09-10): THE LANDING TASK IS SOLVED
+
+**STATE: stopped, nothing running.** `models/bc_dagger1_land.pth` flies
+`landing_target_80mm` **5/5, touching down 0.109m from the pad centre at
+-0.027 m/s**, and 5/5 again in the jittered collector harness. The plan from
+2026-09-09 is complete end to end: probes -> scorer -> expert -> TRIM_RANGE ->
+collect -> distil -> DAgger.
+
+### Result
+
+| | pad offset | touchdown vz | eval_flight | jittered collector |
+| --- | --- | --- | --- | --- |
+| `LineExpert` (ceiling) | 0.045m | -0.032 m/s | 10/10 | 40/40 |
+| `bc_expert_land_v1` | **0.53m** | -0.028 m/s | **5/5** | **0/25 (all flyaway)** |
+| **`bc_dagger1_land`** | **0.109m** | -0.027 m/s | **5/5** | **5/5** |
+
+Cross-track along the 20m line is 0.015m and every episode finishes in ~19.0s
+against the expert's 18.6s.
+
+### The expert-only student landed 5/5 FIRST TRY -- and that was misleading
+
+This is the first expert-only student in the project's history to complete a
+course without DAgger (the gate students managed 1.0/3, 3.4/10 and 5.6/10).
+The task is genuinely easier: a straight line with a painted guidance line,
+one target, and no ordering ambiguity. `user/angle` in the expert tub has
+std **0.055** with 0% of frames past 0.5 -- there is almost no yaw decision to
+get wrong.
+
+**But 5/5 under `eval_flight` hid a policy that fails 25/25 elsewhere.** It
+touched down 0.53m from the pad against the expert's 0.045m, consistently
+LONG (along-track 20.77m against 20.4m). Run in the collector, which jitters
+the spawn, the same student overshot ~1.4m and flew away in every one of 25
+episodes.
+
+The mechanism, straight off a traced rollout: the student overshoots slightly,
+**the pad passes behind it and out of the camera**, the view ahead then looks
+exactly like open cruise, and a memoryless policy emits cruise commands --
+altitude trim snapped from -1.00 to -0.001 and throttle from 0.38 back to
+0.74 in a single second, at x=21.4 and z=0.35. It then climbed away.
+
+That is the 2026-09-06b "the target is outside the camera" family again, and
+the third distinct time it has appeared on this project. **A landing task
+hides it better than a gate course does, because overshooting by half a metre
+still scores as a success.**
+
+### DAgger fixed it, and the coverage numbers say exactly why
+
+`data/tub_35_26-09-10`, 25 episodes, 10,473 rows, every one a flyaway and
+every one KEPT -- which is the point of the round.
+
+| | tub_34 (expert) | tub_35 (DAgger) |
+| --- | --- | --- |
+| forward range | -0.11 .. +0.75 | **-0.75 .. +0.75** (reverse) |
+| forward std | 0.359 | **0.650** |
+| rows past the pad (x>20) | 25.0% | 36.4% |
+| what the expert says there | thr **-0.069** (settling) | thr **-0.605** (come back) |
+| yaw \|x\|>0.2 | 1.5% | **28.7%** |
+
+The expert's own tub does contain rows past x=20 -- it lands slightly beyond
+the pad centre -- but it is never more than a few centimetres out, so it
+never demonstrates a RECOVERY. The DAgger tub does, at -0.605 throttle.
+
+Retrained on both tubs aggregated (25,413 rows), best val **0.002185** against
+**0.000111** for the expert-only run -- a 20x WORSE validation loss for the
+model that flies 5/5 where the other flies 0/25. **The 2026-09-07b lesson
+holds exactly: DAgger validation loss measures the previous policy's mistakes
+on a distribution the improved policy no longer visits. Judge by eval_flight
+only.**
+
+### Label distribution: this task is altitude-dominated
+
+The opposite of the gate courses, and worth knowing before designing the next
+one:
+
+| axis | mean | std | \|x\|>0.5 |
+| --- | --- | --- | --- |
+| yaw | +0.001 | **0.055** | 0.0% |
+| forward speed | +0.496 | 0.359 | 66.7% |
+| lateral speed | +0.002 | 0.113 | 0.9% |
+| **height trim** | **-0.474** | **0.458** | **47.2%** |
+
+Height-trim std is 0.458 here against 0.072 on the flat S-curve and 0.331 on
+the varied-height one. The altitude label is 36% pinned at -1.0, 18% on the
+ramp, 45% near zero.
+
+**The plan expected a badly imbalanced label distribution needing loss
+re-weighting. It does not need it** -- the descent is 8.8s of a 19s episode.
+`TRAIN_LOSS_WEIGHTS` stays uniform.
+
+### The glide slope was tuned on DATA quality, not on landing quality
+
+All three settings land 100% once the plant bug below was fixed, so the choice
+was made on how much of the episode has the pad out of frame:
+
+| flare_alt | duration | pad out of frame | collector pad offset |
+| --- | --- | --- | --- |
+| **-0.1 (floor OFF, default)** | **17.9s** | **3.6%** | 0.058-0.067m |
+| 0.35 | 19.1s | 9.9% | 0.022-0.027m |
+| 0.8 | 21.1s | ~36% | 0.062-0.065m |
+
+`descend_radius = 8` was chosen the same way in Stage 2 (3.3% out of frame
+against 16.7% for a level approach). On this course the camera, not the
+plant, sets the trajectory.
+
+### Do this next
+
+1. **DAgger round 2 is seeded and cheap.** `data/tub_36_26-09-10` already
+   holds 5 episodes flown by `bc_dagger1_land` with expert labels. The
+   remaining gap is 0.109m against the expert's 0.045m; whether that is worth
+   closing depends on whether the pad gets smaller.
+2. **The course cannot discriminate much further.** Every configuration lands.
+   A harder benchmark would put the pad off the line's end (so approach
+   heading matters), shrink it, or add a second decoy pad -- which would
+   finally make the memory question from 2026-09-07b concrete again.
+3. `bc_expert_land_v1` is kept only as the counterexample: it is the model
+   that proves `eval_flight` alone can pass a policy the collector fails.
+   **Evaluate a landing student in BOTH harnesses.**
+4. Debris to delete when convenient: `data/tub_26/27/28_26-09-10` (empty, 8KB
+   each, failed smokes) and `data/tub_29..33_26-09-10` (~70MB total, the flare
+   sweep). `tub_34/35/36` are the real ones.
+5. Still open from earlier: 65mm has never been re-tested airborne on the
+   tamed pitch/roll PIDs or the corrected yaw scaling.
 
 ### Two things expected to go wrong
 

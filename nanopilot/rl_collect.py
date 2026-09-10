@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--approach-gain", type=float, default=0.6)
     parser.add_argument("--descend-radius", type=float, default=8.0)
     parser.add_argument("--land-radius", type=float, default=0.5)
+    parser.add_argument("--flare-alt", type=float, default=-0.1)
     parser.add_argument("--ground-target", type=float, default=-0.1)
     parser.add_argument("--world", default=os.environ.get("GZ_WORLD", "slalom_gates_80mm"))
     parser.add_argument("--airframe", choices=["65mm", "80mm"], default="80mm")
@@ -169,6 +170,7 @@ def main():
                     approach_gain=args.approach_gain,
                     descend_radius=args.descend_radius,
                     land_radius=args.land_radius,
+                    flare_alt=args.flare_alt,
                     ground_target=args.ground_target,
                 )
                 reach = drone_env.altitude_trim_range - (
