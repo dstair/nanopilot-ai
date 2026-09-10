@@ -30,8 +30,10 @@ from donkeycar.parts.tub_v2 import TubWriter
 
 from autonomous_collect import _wait_for_ready, _wait_for_tcp
 from drone_env import build_drone_env
-from eval_flight import parse_world
+from eval_flight import detect_task, parse_world
 from gate_expert import GateExpert
+from line_env import LineChaseEnv
+from line_expert import LineExpert
 from rl_env import GateChaseEnv
 from tub_schema import DRONE_TUB_INPUTS, DRONE_TUB_TYPES
 
@@ -46,6 +48,12 @@ def main():
     parser.add_argument("--lookahead", type=float, default=3.0)
     parser.add_argument("--height-gain", type=float, default=0.75)
     parser.add_argument("--height-lookahead", type=float, default=0.0)
+    # LineExpert only (land task). Defaults match its validated tuning; see
+    # line_expert's docstring for why descend-radius is a camera decision.
+    parser.add_argument("--approach-gain", type=float, default=0.6)
+    parser.add_argument("--descend-radius", type=float, default=8.0)
+    parser.add_argument("--land-radius", type=float, default=0.5)
+    parser.add_argument("--ground-target", type=float, default=-0.1)
     parser.add_argument("--world", default=os.environ.get("GZ_WORLD", "slalom_gates_80mm"))
     parser.add_argument("--airframe", choices=["65mm", "80mm"], default="80mm")
     parser.add_argument("--myconfig", default=None)
@@ -77,9 +85,17 @@ def main():
     # Some helpers (e.g. the altitude-hold pose subscriber) read GZ_WORLD.
     os.environ["GZ_WORLD"] = args.world
 
-    gates, _pad = parse_world(args.world)
-    if not gates:
-        raise SystemExit(f"World {args.world!r} has no gate models")
+    gates, pad_xy = parse_world(args.world)
+    task = detect_task(args.world, gates, pad_xy)
+    if task not in ("gates", "land"):
+        raise SystemExit(
+            f"World {args.world!r} has neither gate models nor a landing pad"
+        )
+    if task == "land" and not args.expert:
+        raise SystemExit(
+            "the land task has no trained teacher; use --expert (LineExpert)"
+        )
+    print(f"World {args.world}: task {task}, gates {len(gates)}, pad {pad_xy}")
 
     myconfig = args.myconfig or f"drone_config_{args.airframe}.py"
     cfg = dk.load_config(
@@ -128,14 +144,16 @@ def main():
         else:
             print(f"WARNING: no env_config.json in {args.policy}; using CLI defaults")
 
-        gate_env = GateChaseEnv(
-            drone_env,
-            gates,
+        env_kwargs = dict(
             rate_hz=env_cfg.get("rate_hz", args.rate_hz),
             max_episode_steps=env_cfg.get("max_episode_steps", args.max_episode_steps),
             control_altitude=env_cfg.get("control_altitude", False),
             altitude_scale=env_cfg.get("altitude_scale", 0.3),
         )
+        if task == "land":
+            gate_env = LineChaseEnv(drone_env, pad_xy, **env_kwargs)
+        else:
+            gate_env = GateChaseEnv(drone_env, gates, **env_kwargs)
 
         if args.expert:
             if not drone_env.velocity_control:
@@ -143,14 +161,38 @@ def main():
                     "--expert needs DRONE_VELOCITY_CONTROL=True; it emits speed "
                     "setpoints, which mean nothing in direct angle mode."
                 )
-            expert = GateExpert.from_env(
-                drone_env, gates,
-                cruise_speed=args.cruise_speed, lookahead=args.lookahead,
-                height_gain=args.height_gain,
-                height_lookahead=args.height_lookahead,
-            )
+            if task == "land":
+                expert = LineExpert.from_env(
+                    drone_env, gate_env.spawn[:2], pad_xy,
+                    cruise_speed=args.cruise_speed, lookahead=args.lookahead,
+                    height_gain=args.height_gain,
+                    approach_gain=args.approach_gain,
+                    descend_radius=args.descend_radius,
+                    land_radius=args.land_radius,
+                    ground_target=args.ground_target,
+                )
+                reach = drone_env.altitude_trim_range - (
+                    gate_env.start_alt - args.ground_target
+                )
+                if reach < 0:
+                    raise SystemExit(
+                        f"DRONE_ALTITUDE_TRIM_RANGE={drone_env.altitude_trim_range} "
+                        f"cannot reach {args.ground_target}m from a "
+                        f"{gate_env.start_alt}m cruise (short by {-reach:.2f}m). "
+                        "The expert would hover instead of landing and the whole "
+                        "collection would be wasted. Raise it to at least "
+                        f"{gate_env.start_alt - args.ground_target:.1f}."
+                    )
+            else:
+                expert = GateExpert.from_env(
+                    drone_env, gates,
+                    cruise_speed=args.cruise_speed, lookahead=args.lookahead,
+                    height_gain=args.height_gain,
+                    height_lookahead=args.height_lookahead,
+                )
             norm = model = None
-            print(f"Expert: cruise={args.cruise_speed} lookahead={args.lookahead}")
+            print(f"Expert: {type(expert).__name__} cruise={args.cruise_speed} "
+                  f"lookahead={args.lookahead}")
         else:
             from stable_baselines3 import PPO
             from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -175,8 +217,12 @@ def main():
             while not (terminated or truncated):
                 if args.expert:
                     tel = gate_env.last_telemetry
-                    action = (expert.act_from_telemetry(tel, gate_env._gate_idx)
-                              if tel else np.zeros(4))
+                    if not tel:
+                        action = np.zeros(4)
+                    elif task == "land":
+                        action = expert.act_from_telemetry(tel)
+                    else:
+                        action = expert.act_from_telemetry(tel, gate_env._gate_idx)
                 else:
                     action, _ = model.predict(
                         norm.normalize_obs(obs), deterministic=not args.stochastic
@@ -201,19 +247,29 @@ def main():
 
             result = info.get("episode_result", "unknown")
             gates_passed = info.get("gates_passed", 0)
-            keep = (args.keep_crashed or result in ("completed", "timeout")) and (
-                gates_passed >= args.min_gates
-            )
+            if task == "land":
+                # Only a clean landing. "timeout" is a drone still airborne at
+                # the step limit and "skidded"/"landed_off_pad" are the wrong
+                # behaviour arriving at the right place -- keeping any of them
+                # teaches the student exactly what it must not do.
+                keep = args.keep_crashed or result == "completed"
+            else:
+                keep = (
+                    args.keep_crashed or result in ("completed", "timeout")
+                ) and gates_passed >= args.min_gates
             if keep:
                 for row in rows:
                     tub_writer.run(*row)
                 kept += 1
             else:
                 dropped += 1
+            if task == "land":
+                detail = gate_env._task_summary()
+            else:
+                detail = f"gates {gates_passed}/{len(gates)}"
             print(
-                f"Episode {ep + 1}/{args.episodes}: {result}, "
-                f"gates {gates_passed}/{len(gates)}, {len(rows)} rows "
-                f"({'kept' if keep else 'dropped'})"
+                f"Episode {ep + 1}/{args.episodes}: {result}, {detail}, "
+                f"{len(rows)} rows ({'kept' if keep else 'dropped'})"
             )
     finally:
         if tub_writer is not None:

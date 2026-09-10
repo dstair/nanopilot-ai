@@ -33,8 +33,10 @@ from donkeycar.parts.tub_v2 import TubWriter
 
 from autonomous_collect import _wait_for_ready, _wait_for_tcp
 from drone_env import build_drone_env
-from eval_flight import parse_world
+from eval_flight import detect_task, parse_world
 from gate_expert import GateExpert
+from line_env import LineChaseEnv
+from line_expert import LineExpert
 from rl_env import GateChaseEnv
 from torch_pilot import TorchPilot
 from tub_schema import DRONE_TUB_INPUTS, DRONE_TUB_TYPES
@@ -55,6 +57,11 @@ def main():
     parser.add_argument("--lookahead", type=float, default=3.0)
     parser.add_argument("--height-gain", type=float, default=0.75)
     parser.add_argument("--height-lookahead", type=float, default=0.0)
+    # LineExpert only (land task); defaults match its validated tuning.
+    parser.add_argument("--approach-gain", type=float, default=0.6)
+    parser.add_argument("--descend-radius", type=float, default=8.0)
+    parser.add_argument("--land-radius", type=float, default=0.5)
+    parser.add_argument("--ground-target", type=float, default=-0.1)
     parser.add_argument("--student", required=True,
                         help="student .pth flown to generate the state distribution")
     parser.add_argument("--world", default="slalom_gates_80mm")
@@ -90,9 +97,17 @@ def main():
             raise SystemExit(f"Missing {path}")
 
     os.environ["GZ_WORLD"] = args.world
-    gates, _pad = parse_world(args.world)
-    if not gates:
-        raise SystemExit(f"World {args.world!r} has no gate models")
+    gates, pad_xy = parse_world(args.world)
+    task = detect_task(args.world, gates, pad_xy)
+    if task not in ("gates", "land"):
+        raise SystemExit(
+            f"World {args.world!r} has neither gate models nor a landing pad"
+        )
+    if task == "land" and not args.expert:
+        raise SystemExit(
+            "the land task has no trained teacher; use --expert (LineExpert)"
+        )
+    print(f"World {args.world}: task {task}, gates {len(gates)}, pad {pad_xy}")
 
     myconfig = args.myconfig or f"drone_config_{args.airframe}.py"
     cfg = dk.load_config(
@@ -134,13 +149,16 @@ def main():
             else:
                 print(f"WARNING: no env_config.json in {args.policy}; using CLI defaults")
 
-        gate_env = GateChaseEnv(
-            drone_env, gates,
+        env_kwargs = dict(
             rate_hz=env_cfg.get("rate_hz", args.rate_hz),
             max_episode_steps=env_cfg.get("max_episode_steps", args.max_episode_steps),
             control_altitude=env_cfg.get("control_altitude", False),
             altitude_scale=env_cfg.get("altitude_scale", 0.3),
         )
+        if task == "land":
+            gate_env = LineChaseEnv(drone_env, pad_xy, **env_kwargs)
+        else:
+            gate_env = GateChaseEnv(drone_env, gates, **env_kwargs)
         alt_scale = gate_env.altitude_scale
         control_alt = gate_env.control_altitude
 
@@ -150,15 +168,27 @@ def main():
                     "--expert needs DRONE_VELOCITY_CONTROL=True; it emits speed "
                     "setpoints, which mean nothing in direct angle mode."
                 )
-            expert = GateExpert.from_env(
-                drone_env, gates,
-                cruise_speed=args.cruise_speed, lookahead=args.lookahead,
-                height_gain=args.height_gain,
-                height_lookahead=args.height_lookahead,
-            )
+            if task == "land":
+                expert = LineExpert.from_env(
+                    drone_env, gate_env.spawn[:2], pad_xy,
+                    cruise_speed=args.cruise_speed, lookahead=args.lookahead,
+                    height_gain=args.height_gain,
+                    approach_gain=args.approach_gain,
+                    descend_radius=args.descend_radius,
+                    land_radius=args.land_radius,
+                    ground_target=args.ground_target,
+                )
+            else:
+                expert = GateExpert.from_env(
+                    drone_env, gates,
+                    cruise_speed=args.cruise_speed, lookahead=args.lookahead,
+                    height_gain=args.height_gain,
+                    height_lookahead=args.height_lookahead,
+                )
             norm = teacher = None
-            print(f"Expert labeller: cruise={args.cruise_speed} "
-                  f"lookahead={args.lookahead} height_gain={args.height_gain}")
+            print(f"Expert labeller: {type(expert).__name__} "
+                  f"cruise={args.cruise_speed} lookahead={args.lookahead} "
+                  f"height_gain={args.height_gain}")
         else:
             from stable_baselines3 import PPO
             from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -201,8 +231,12 @@ def main():
                 # which the expert's flawless rollouts never visit.
                 if expert is not None:
                     tel_now = gate_env.last_telemetry
-                    t_action = (expert.act_from_telemetry(tel_now, gate_env._gate_idx)
-                                if tel_now is not None else np.zeros(4, dtype=np.float32))
+                    if tel_now is None:
+                        t_action = np.zeros(4, dtype=np.float32)
+                    elif task == "land":
+                        t_action = expert.act_from_telemetry(tel_now)
+                    else:
+                        t_action = expert.act_from_telemetry(tel_now, gate_env._gate_idx)
                 else:
                     t_action, _ = teacher.predict(norm.normalize_obs(obs), deterministic=True)
                 t_action = np.clip(np.asarray(t_action, dtype=np.float32).flatten(), -1.0, 1.0)
@@ -254,9 +288,10 @@ def main():
                 kept += 1
             else:
                 dropped += 1
-            print(f"Episode {ep + 1}/{args.episodes}: {result}, "
-                  f"gates {gates_passed}/{len(gates)}, {len(rows)} rows "
-                  f"({'kept' if keep else 'dropped'})")
+            detail = (gate_env._task_summary() if task == "land"
+                      else f"gates {gates_passed}/{len(gates)}")
+            print(f"Episode {ep + 1}/{args.episodes}: {result}, {detail}, "
+                  f"{len(rows)} rows ({'kept' if keep else 'dropped'})")
     finally:
         if tub_writer is not None:
             tub_writer.shutdown()

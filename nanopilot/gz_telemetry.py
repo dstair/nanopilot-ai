@@ -177,14 +177,36 @@ class PoseTracker:
         self.latest_yaw = getattr(_pose_node, "latest_yaw", 0.0)
         now = time.time()
         self._update_velocity(now)
-        if self._prev is not None and self._prev_time is not None:
-            dt = now - self._prev_time
-            if dt > 0:
-                vz = (self.latest[2] - self._prev[2]) / dt
-                # Saturate, never zero — see SimTelemetry._on_pose.
-                self.vz = max(-MAX_VELOCITY, min(MAX_VELOCITY, vz))
-        self._prev = self.latest
-        self._prev_time = now
+        # Only difference when the pose sample actually CHANGED -- the same
+        # guard _update_velocity has carried since it was written, and the
+        # reason is identical. update() is driven by run_threaded, which
+        # callers poll faster than Gazebo publishes poses, so differencing on
+        # every call reads a stale-but-identical position as genuine ZERO
+        # vertical motion. The altitude hold's damping term is -K*vz with
+        # K=90, and in a descent that term IS the control, so a vz that
+        # collapses to zero between pose updates removes the damping
+        # altogether.
+        #
+        # Measured 2026-09-10: GateChaseEnv.step calls run_threaded TWICE per
+        # control period, which doubled the aliasing. A landing that
+        # eval_flight (one call per period) flew to touchdown at -0.02 m/s
+        # became a near-undamped fall at -1.02 m/s, with the throttle sitting
+        # at 1468 while the drone fell at 0.96 m/s -- the damper was reading
+        # vz ~ -0.017. Holding the last real estimate instead of publishing a
+        # phantom zero makes the damper independent of how often it is polled.
+        #
+        # Same failure family as the MAX_VELOCITY note above: a velocity
+        # estimator that reports a confident wrong number, believed by a loop
+        # that cannot tell.
+        if self.latest != self._prev:
+            if self._prev is not None and self._prev_time is not None:
+                dt = now - self._prev_time
+                if dt > 0:
+                    vz = (self.latest[2] - self._prev[2]) / dt
+                    # Saturate, never zero — see SimTelemetry._on_pose.
+                    self.vz = max(-MAX_VELOCITY, min(MAX_VELOCITY, vz))
+            self._prev = self.latest
+            self._prev_time = now
 
     def _update_velocity(self, now):
         """Low-passed world-frame velocity for the velocity cascade.

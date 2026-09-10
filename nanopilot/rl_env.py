@@ -72,6 +72,9 @@ class GateChaseEnv(gym.Env):
         settle_vz=1.0,
         liftoff_vz=1.0,
         min_start_alt=0.8,
+        handover_vz=0.05,
+        handover_pos_tol=0.4,
+        handover_timeout=20.0,
         reset_timeout=30.0,
         settle_s=1.0,
         crash_z=0.12,
@@ -113,6 +116,9 @@ class GateChaseEnv(gym.Env):
         self.settle_vz = float(settle_vz)
         self.liftoff_vz = float(liftoff_vz)
         self.min_start_alt = float(min_start_alt)
+        self.handover_vz = float(handover_vz)
+        self.handover_pos_tol = float(handover_pos_tol)
+        self.handover_timeout = float(handover_timeout)
         self.reset_timeout = float(reset_timeout)
         self.settle_s = float(settle_s)
         self.crash_z = float(crash_z)
@@ -231,10 +237,50 @@ class GateChaseEnv(gym.Env):
         reward -= self.gyro_penalty * float(
             math.sqrt(imu[3] ** 2 + imu[4] ** 2 + imu[5] ** 2)
         )
+        # --- task progress (gate crossing here; landing in LineChaseEnv) ---
+        task_reward, terminated, info = self._task_step(pos, outputs)
+        reward += task_reward
+
+        # --- crash / flyaway ---
+        if not terminated:
+            if pos[2] < self.crash_z or (
+                abs(att[0]) > self.crash_tilt_deg or abs(att[1]) > self.crash_tilt_deg
+            ):
+                reward -= self.crash_penalty
+                terminated = True
+                info["episode_result"] = "crashed"
+            elif pos[2] > self.flyaway_z or math.hypot(pos[0], pos[1]) > self.bounds_xy:
+                reward -= self.crash_penalty
+                terminated = True
+                info["episode_result"] = "flyaway"
+
+        self._steps += 1
+        truncated = not terminated and self._steps >= self.max_episode_steps
+        if terminated or truncated:
+            self.hold_hover()
+            info.setdefault("episode_result", "timeout")
+            logger.info(
+                "Episode end: %s, %s, %d steps",
+                info["episode_result"], self._task_summary(), self._steps,
+            )
+        info.update(self._task_info())
+
+        self._prev_action = action
+        obs = self._build_obs(outputs)
+        return obs, float(reward), terminated, truncated, info
+
+    # ------------------------------------------------------------------
+    # Task hooks. Everything else in step() -- timing, telemetry, crash,
+    # flyaway, truncation -- is task-agnostic, so a different task subclasses
+    # these three rather than duplicating the loop around them. See
+    # line_env.LineChaseEnv.
+
+    def _task_step(self, pos, outputs):
+        """Gate progress and passing. Returns (reward, terminated, info)."""
+        reward = 0.0
         terminated = False
         info = {}
 
-        # --- gate progress / passing ---
         gate = self.gates[self._gate_idx]
         dist = self._gate_dist(gate, pos)
         reward += self.progress_scale * (self._prev_dist - dist)
@@ -274,34 +320,14 @@ class GateChaseEnv(gym.Env):
                 self._prev_gate_lx = self._gate_local_x(self.gates[self._gate_idx], pos)
         else:
             self._prev_gate_lx = lx
+        return reward, terminated, info
 
-        # --- crash / flyaway ---
-        if not terminated:
-            if pos[2] < self.crash_z or (
-                abs(att[0]) > self.crash_tilt_deg or abs(att[1]) > self.crash_tilt_deg
-            ):
-                reward -= self.crash_penalty
-                terminated = True
-                info["episode_result"] = "crashed"
-            elif pos[2] > self.flyaway_z or math.hypot(pos[0], pos[1]) > self.bounds_xy:
-                reward -= self.crash_penalty
-                terminated = True
-                info["episode_result"] = "flyaway"
+    def _task_info(self):
+        """Per-step info merged into every step()'s return."""
+        return {"gates_passed": self._gates_passed}
 
-        self._steps += 1
-        truncated = not terminated and self._steps >= self.max_episode_steps
-        if terminated or truncated:
-            self.hold_hover()
-            info.setdefault("episode_result", "timeout")
-            logger.info(
-                "Episode end: %s, gates %d/%d, %d steps",
-                info["episode_result"], self._gates_passed, len(self.gates), self._steps,
-            )
-        info["gates_passed"] = self._gates_passed
-
-        self._prev_action = action
-        obs = self._build_obs(outputs)
-        return obs, float(reward), terminated, truncated, info
+    def _task_summary(self):
+        return f"gates {self._gates_passed}/{len(self.gates)}"
 
     def hold_hover(self):
         """Neutral sticks; altitude damper holds height. Used between rollouts."""
@@ -513,13 +539,44 @@ class GateChaseEnv(gym.Env):
                     # term this is a no-op and the old behaviour stands.
                     if getattr(self._env, "altitude_hold_kp", 0.0) > 0.0:
                         self._env.set_altitude_setpoint(self.start_alt)
-                        for _ in range(int(4.0 / 0.05)):
+                        # Hand over AT REST, gated on VELOCITY -- not on
+                        # distance to start_alt. The hold is a position
+                        # regulator that settles ~0.10m ABOVE its setpoint (the
+                        # plant's residual thrust bias over Kp, measured
+                        # 2026-09-09), so "z is within 0.1m of start_alt" is
+                        # satisfied on the way THROUGH, 0.19m below where the
+                        # drone will actually come to rest. Handing over there
+                        # injects a step into a loop the expert then closes
+                        # again with Kz, giving zeta' = zeta/sqrt(1+Kz) ~ 0.32:
+                        # the drone rings at +-0.12m for the whole flight.
+                        # Gate courses absorb that. The landing expert does
+                        # not -- entering its glide on a downswing built the
+                        # descent to 0.51 m/s against the 0.34 m/s the glide
+                        # asks for, and put the drone on the ground 2m short of
+                        # the pad. Cost of waiting is a few seconds per reset.
+                        #
+                        # 30 CONSECUTIVE samples (1.5s), not a handful: at a
+                        # turning point of that ring |vz| sits under 0.05 for
+                        # ~0.7s, so a shorter window is satisfied by the peak
+                        # of the oscillation rather than by its absence.
+                        deadline_h = time.time() + self.handover_timeout
+                        settled = 0
+                        while time.time() < deadline_h:
                             o = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)
-                            if (abs(o[POS][2] - self.start_alt) < 0.15
-                                    and abs(o[VEL][2]) < 0.15):
-                                break
+                            if (abs(o[VEL][2]) < self.handover_vz
+                                    and abs(o[POS][2] - self.start_alt)
+                                    < self.handover_pos_tol):
+                                settled += 1
+                                if settled >= 30:
+                                    break
+                            else:
+                                settled = 0
                             time.sleep(0.05)
                         z = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)[POS][2]
+                        if settled < 30:
+                            logger.warning(
+                                "Handover not at rest: z=%.2f (target %.2f)",
+                                z, self.start_alt)
                     logger.info("Takeoff settled at z=%.2f", z)
                     return True
             else:

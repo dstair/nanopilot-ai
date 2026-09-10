@@ -34,6 +34,30 @@ Three things about the height law are load-bearing:
     label a drone that has drifted back off the pad with "climb and go round"
     rather than with whatever the last phase happened to be.
 
+  * **The glide stops at `flare_alt` (0.8m) and the last 0.8m is flown by the
+    PLANT, not by the reference.** Inside `land_radius` the command saturates
+    at -1 and the hold simply drives toward `ground_target`; because a
+    terminal descent settles at `vz = (Kp/K) * error = error/3`, that is a
+    PROPORTIONAL descent -- 0.3 m/s at 0.8m, 0.05 m/s at touchdown -- which
+    Stage 0 measured landing at 0.02 m/s. It is soft by construction and
+    needs no tuning. The glide's only job is to deliver the drone over the
+    pad, at 0.8m, without much vertical momentum.
+
+    Getting `flare_alt` wrong in either direction was measured. Without a
+    floor at all, the reference is already at 0.145m while the drone is still
+    1.65m from the pad, so it lands short at cruise speed (1.7 m/s
+    horizontally, `skidded`/`crashed` 4 for 4). At 0.35m the drone reaches the
+    pad correctly but arrives with 0.4-0.5 m/s of momentum built during a
+    1.15m glide, and the PD cannot shed it in the remaining 0.35m: touchdown
+    -0.32 to -0.56 m/s. At 0.8m the glide only has to lose 0.7m over 7.5m of
+    travel, so it arrives slow.
+
+    A RATE LIMIT on the reference was tried instead and does not work, for a
+    reason worth remembering: near the ground the command is saturated at -1,
+    so the effective target is pinned at `setpoint - TRIM_RANGE` and the
+    expert has no authority to modulate the descent at all. Anything clever
+    written into the reference there is simply discarded by the clip.
+
   * **The ramp SATURATES at `land_radius`, it does not taper to the target.**
     A reference that only reaches the ground target as d -> 0 never lands: the
     hold settles ~0.10m above whatever it is asked for (the plant's residual
@@ -113,7 +137,10 @@ class LineExpert:
         approach_gain=0.6,
         descend_radius=8.0,
         land_radius=0.5,
+        flare_alt=0.8,
         ground_target=-0.1,
+        hold_kp=30.0,
+        hold_k=90.0,
         yaw_hold_radius=1.5,
         altitude_setpoint_fn=None,
     ):
@@ -137,7 +164,15 @@ class LineExpert:
         self.approach_gain = float(approach_gain)
         self.descend_radius = float(descend_radius)
         self.land_radius = float(land_radius)
+        # Floor on the glide: the reference may not go below this until the
+        # drone is within land_radius of the pad. Pairs with _rate_limit --
+        # see the module docstring, neither works without the other.
+        self.flare_alt = float(flare_alt)
         self.ground_target = float(ground_target)
+        # Plant gains, only used to reason about descent rate (see the
+        # module docstring): a terminal descent settles at vz = (Kp/K)*error.
+        self.hold_kp = float(hold_kp)
+        self.hold_k = float(hold_k)
         # Inside this radius the heading command is frozen. The bearing to a
         # carrot the drone is sitting on top of is numerical noise, and acting
         # on it spins the drone while it is trying to settle.
@@ -156,20 +191,24 @@ class LineExpert:
             altitude_trim_range=getattr(drone_env, "altitude_trim_range", 1.0),
             max_yaw_rate_rad=math.radians(getattr(drone_env, "max_yaw_rate", 120.0)),
             altitude_setpoint_fn=getattr(drone_env, "get_altitude_setpoint", None),
+            hold_kp=getattr(drone_env, "altitude_hold_kp", 30.0),
+            hold_k=getattr(drone_env, "altitude_hold_k", 90.0),
             **kwargs,
         )
 
     def _height_ref(self, d_pad, cruise_alt):
         """Course height at the drone's own distance from the pad.
 
-        Cruise height beyond `descend_radius`, `ground_target` inside
-        `land_radius`, linear between. See the module docstring for why the
-        inner end saturates instead of tapering to the target.
+        Cruise height beyond `descend_radius`, gliding to `flare_alt` at
+        `land_radius`, and `ground_target` once inside it. See the module
+        docstring for why the inner end saturates instead of tapering, and why
+        the flare floor and the rate limit are a matched pair.
         """
+        if d_pad <= self.land_radius:
+            return self.ground_target
         span = max(1e-6, self.descend_radius - self.land_radius)
-        f = (d_pad - self.land_radius) / span
-        f = min(1.0, max(0.0, f))
-        return self.ground_target + f * (cruise_alt - self.ground_target)
+        f = min(1.0, max(0.0, (d_pad - self.land_radius) / span))
+        return self.flare_alt + f * (cruise_alt - self.flare_alt)
 
     def act(self, pos, yaw_rad):
         """Return [steering, throttle, roll, altitude] for the current state.

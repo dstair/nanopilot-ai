@@ -204,6 +204,7 @@ uv run --env-file .env python -m py_compile \
   nanopilot/test_thrust.py nanopilot/eval_flight.py \
   nanopilot/rl_env.py nanopilot/rl_train.py nanopilot/rl_collect.py \
   nanopilot/dagger_collect.py nanopilot/gate_expert.py nanopilot/line_expert.py \
+  nanopilot/line_env.py \
   nanopilot/gz_reset_worker.py nanopilot/gz_camera_worker.py \
   scripts/gate_rollout.py scripts/ff_sweep.py scripts/detach_launch.py \
   scripts/promote_checkpoint.py scripts/alt_phase.py \
@@ -297,6 +298,7 @@ RC packet format: `struct.pack('<d', timestamp)` plus 16 little-endian
 | `nanopilot/eval_flight.py` | closed-loop autopilot eval: survival/progress/gate metrics, JSON |
 | `nanopilot/gate_expert.py` | scripted pure-pursuit gate expert over velocity setpoints |
 | `nanopilot/line_expert.py` | scripted line-follow + landing expert; glide slope sized by camera FOV |
+| `nanopilot/line_env.py` | `LineChaseEnv`: GateChaseEnv with landing termination, for the collectors |
 | `nanopilot/rl_env.py` | `GateChaseEnv`: state-based Gymnasium env over a live DroneGymEnv |
 | `nanopilot/rl_train.py` | PPO trainer for the state-based RL gate teacher |
 | `nanopilot/rl_collect.py` | flies the expert (`--expert`) or an RL teacher, records tubs for BC distillation |
@@ -2624,6 +2626,117 @@ task yet:
 
 Expect the established pattern: the expert-only student flies on-manifold and
 fails off it, and one DAgger round fixes it.
+
+### STAGE 4a RESULT (2026-09-10): collectors do the land task, and finding
+### out why cost a PLANT BUG that had been silently weakening the altitude
+### damper for every caller
+
+**STATE: stopped, nothing running.** No config or world changed.
+`nanopilot/line_env.py` is new; `rl_env.py`, `gz_telemetry.py`, `rl_collect.py`,
+`dagger_collect.py`, `line_expert.py`, `eval_flight.py` changed. Gate courses
+re-validated (below) and they IMPROVED.
+
+#### THE BUG: PoseTracker published a phantom vz of zero between pose updates
+
+`PoseTracker.update()` differenced consecutive pose samples **whether or not
+Gazebo had published a new one**. It is driven by `run_threaded`, which every
+caller polls faster than the pose topic publishes, so most calls saw an
+unchanged position and computed `vz = 0`. The altitude hold's damping term is
+`-K*vz` with K=90, and in a descent that term IS the control -- so the damper
+intermittently vanished.
+
+Its sibling `_update_velocity` (the filtered world-frame velocity) has carried
+a guard against exactly this since it was written; the raw `vz` path never got
+one. **Same failure family as the MAX_VELOCITY lesson: a velocity estimator
+that reports a confident wrong number to a loop that cannot tell.**
+
+Why it surfaced now: `GateChaseEnv.step` calls `run_threaded` TWICE per control
+period, doubling the aliasing, while `eval_flight` calls it once. Nothing on a
+gate course commands a sustained descent, so the missing damping never showed
+there. A landing is nothing but a sustained descent:
+
+| | eval_flight (1 call/period) | collector (2 calls/period) |
+| --- | --- | --- |
+| touchdown | **-0.02 m/s** | **-1.02 m/s** |
+| throttle while falling at 0.96 m/s | -- | **1468** (hover is 1480) |
+| what the damper thought vz was | -- | **-0.017 m/s** |
+
+That throttle number is the proof: a working damper would have commanded ~1556.
+
+**Fixed** in `gz_telemetry.PoseTracker.update()`: only difference when the pose
+actually changed, holding the last real estimate otherwise. The damper is now
+independent of how often it is polled.
+
+**Re-validated on the gate courses, and the fix strictly improves them:**
+
+| | before fix | after fix |
+| --- | --- | --- |
+| expert crossings, `s_curve_heights_80mm` | 50/50 | **50/50** |
+| expert lateral offset | 0.10m mean | **0.10m mean** |
+| expert height error at crossing | 0.36m mean, 0.73 max | **0.23m mean, 0.45 max** |
+| `bc_dagger1_heights` | 5/5, 10/10, 0.235m | **5/5, 10/10, 0.234m** |
+
+#### The other real difference: GateChaseEnv handed over a RINGING drone
+
+`_arrest_climb` finished on `|z - start_alt| < 0.15`. The hold settles ~0.10m
+ABOVE its setpoint (Stage 0), so that test is satisfied on the way THROUGH,
+about 0.19m below where the drone will actually come to rest. Handing over
+there injects a step into a loop the expert then closes again with Kz, giving
+`zeta' = zeta/sqrt(1+Kz) ~ 0.32`: the drone rang at +-0.12m for the entire
+flight. Gate courses absorb that; a glide slope does not.
+
+Now gated on VELOCITY -- 30 consecutive samples (1.5s) of `|vz| < 0.05` --
+because at a turning point of that ring `|vz|` sits under 0.05 for ~0.7s, so a
+shorter window is satisfied by the peak of the oscillation rather than by its
+absence. Cruise altitude went from a +-0.12m ring to a steady 1.51-1.59m.
+
+#### LineExpert: the flare floor, and two rejected alternatives
+
+`flare_alt` (0.8m) stops the glide above the ground until the drone is within
+`land_radius` of the pad; the last 0.8m is then flown by the PLANT, whose
+terminal descent settles at `vz = (Kp/K)*error = error/3` and lands at
+-0.03 m/s with no tuning. Without the floor the reference is already at 0.145m
+while the drone is still 1.65m out, so it lands short at cruise speed --
+`skidded`/`crashed`, 4 for 4.
+
+Rejected: a RATE LIMIT on the reference. It cannot work near the ground,
+because the command is saturated at -1 there and the effective target is
+pinned at `setpoint - TRIM_RANGE`. **Anything clever written into the height
+reference in the last metre is discarded by the clip.**
+
+#### Collector plumbing
+
+`GateChaseEnv` grew three task hooks -- `_task_step`, `_task_info`,
+`_task_summary` -- and everything else in `step()` (timing, telemetry, crash,
+flyaway, truncation) is shared. `LineChaseEnv` overrides them with landing
+termination and passes the pad to the parent AS A ONE-ENTRY GATE LIST, which
+is not a hack: on this task the pad genuinely is the single target, so
+`_gate_dist` becomes distance to the pad.
+
+**Touchdown is classified by `eval_flight.classify_touchdown`, the same
+function the scorer uses.** A collector that kept episodes the evaluator calls
+crashes would poison the tub with exactly the labels the student must not
+learn. `crash_z` is disabled in `LineChaseEnv` (-1.0) because a textbook
+landing passes the parent's 0.12 on the way down.
+
+`rl_collect.py` and `dagger_collect.py` both detect the task from the world and
+build `LineChaseEnv` + `LineExpert` for `land`. `rl_collect` keeps ONLY
+`completed` on that task -- `timeout` is a drone still airborne, and
+`skidded`/`landed_off_pad` are the wrong behaviour arriving at the right place.
+It also refuses to start if `TRIM_RANGE` cannot reach `ground_target`, rather
+than wasting a 25-minute collection hovering.
+
+Collection verified: **4/4 kept, all `completed`, touchdown -0.031 m/s,
+0.058-0.064m from the pad**, ~420 rows per episode.
+
+#### Do this next
+
+1. Collect ~40 episodes and distil. `dagger_collect --expert` on the land task
+   is WIRED BUT UNFLOWN -- there is no student yet to fly it.
+2. `flare_alt = 0.8` costs ~2.5s of vertical descent over the pad with the pad
+   out of frame (85 deg depression at 0.8m over the pad, against +-64 deg of
+   vertical FOV). Worth comparing against a lower flare now that the damper
+   works, on DATA quality rather than on landing quality -- both land.
 
 ### Two things expected to go wrong
 
