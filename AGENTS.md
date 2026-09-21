@@ -2864,14 +2864,3 @@ plant, sets the trajectory.
 5. Still open from earlier: 65mm has never been re-tested airborne on the
    tamed pitch/roll PIDs or the corrected yaw scaling.
 
-### Two things expected to go wrong
-
-- **The descent eats the clip budget.** It is the only phase that deliberately
-  builds `vz`. If landings turn unreliable, check `alt_hold_bias` saturation in
-  a `--trace-output` run BEFORE touching any gain -- that is the mistake made
-  on 2026-09-08.
-- **The label distribution is badly imbalanced**: a long cruise and a brief
-  descent. The landing may need over-weighting or the student will smooth it
-  away. Note `TRAIN_LOSS_WEIGHTS` is uniform `[1,1,1,1]` and the standing advice
-  is not to re-tune it without flight data -- this task may be the first real
-  reason to.
