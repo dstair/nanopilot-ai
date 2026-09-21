@@ -13,6 +13,8 @@ This adapts DonkeyCar's implementation in a number of ways:
 - use Gazebo for simulation. There are various adaptations for drone flight: drones move in 3D via pitch/yaw/roll, and throttle commands. This required a significant re-design of the controls.
 - The CNN is now updated to take control input data, and IMU data (basically movement data). This gives the model some key inputs for flight; the model still sees the image, but now knows if the user punches the throttle and tilts the drone forward aggressively.
 
+**The current autopilots are trained with no human pilot at all** — a scripted expert flies the course and the vision model is distilled from it (behaviour cloning + DAgger). See [README_IMITATION_LEARNING.md](README_IMITATION_LEARNING.md) for the method, the end-to-end commands, and how to watch it fly.
+
 ## Model updates
 
 Why the name Multi-modal Attention-fused Residual CNN-GRU? It captures the vision part (Residual CNN), the temporal IMU part (GRU), and the integration mechanism (Multi-head Attention).
