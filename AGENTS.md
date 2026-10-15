@@ -1012,7 +1012,16 @@ back) and handed over on `|z - start_alt| < 0.15`, the on-the-way-through test
 `--takeoff-timeout` 10 -> 15s. Re-measured under it (5 runs, 20Hz):
 `LineExpert` 5/5 at 0.044m / -0.032 m/s; `bc_dagger1_land` 5/5 at **0.120m**
 (0.111-0.126) / -0.029 m/s. Numbers above are from the old takeoff.
-`bc_dagger1_heights`/`_scurve` have NOT been re-flown under it.
+On `s_curve_heights_80mm` (2 runs each): `GateExpert` 10/10 at 0.232m
+crossing height error, `bc_dagger1_heights` 10/10 at 0.233m (was 0.254m).
+`bc_dagger1_scurve` has NOT been re-flown under it.
+
+`eval_flight --expert` now flies `GateExpert` on gate courses too (gate index
+advances on ANY crossing of the current gate's plane, as in `GateChaseEnv`),
+and `--record-dir=DIR` saves every camera frame the pilot is handed as
+`DIR/epNN/NNNNN.jpg` (holds 20 fps). The README's "See it fly" videos were
+made this way; the MP4s are hosted as GitHub attachments on issue #1, not in
+the repo.
 
 ### The expert-only student landed 5/5 FIRST TRY -- and that was misleading
 

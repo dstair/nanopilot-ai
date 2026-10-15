@@ -6,7 +6,6 @@ The idea here is that you can train and run a Multi-modal Attention-fused Networ
 
 1. Fly around manually; press the record button to keep training data.
 2. Train a CNN using that data. The output is an autopilot that flies like you.
-3. $un the same simulation using the 
 
 This adapts DonkeyCar's implementation in a number of ways:
 - use BetaFlight Software in the Loop. This means you might be able to swap in a real BetaFlight drone (Hardware in the Loop), and use the same flow as above to build an autopilot for it.
@@ -14,6 +13,51 @@ This adapts DonkeyCar's implementation in a number of ways:
 - The CNN is now updated to take control input data, and IMU data (basically movement data). This gives the model some key inputs for flight; the model still sees the image, but now knows if the user punches the throttle and tilts the drone forward aggressively.
 
 **The current autopilots are trained with no human pilot at all** — a scripted expert flies the course and the vision model is distilled from it (behaviour cloning + DAgger). See [README_IMITATION_LEARNING.md](README_IMITATION_LEARNING.md) for the method, the end-to-end commands, and how to watch it fly.
+
+## See it fly
+
+Every clip is the drone's own forward camera (140° field of view), recorded
+in the simulator at 20 frames per second. The two pilots in each pair see the
+world very differently:
+
+- The **expert** is a short scripted controller. It reads the drone's exact
+  position from the simulator and never looks at the camera at all.
+- The **student** is the trained neural network. It flies from these camera
+  frames, plus the drone's motion sensors (IMU) and velocity, and nothing
+  else. It never sees a map or its own position.
+
+So the student video is literally everything the network had to work with.
+
+### Gates: 10-gate S-curve at varying heights (`s_curve_heights_80mm`)
+
+**Expert** (`GateExpert`): 10/10 gates, passing on average 0.23m from each
+gate's centre height.
+
+https://github.com/user-attachments/assets/933159c4-ced0-485c-b88d-6fc51859b67b
+
+**Student** (`models/bc_dagger1_heights.pth`): 10/10 gates, 0.23m.
+
+https://github.com/user-attachments/assets/9b5a73f8-b662-415f-ac23-b7b34ed154be
+
+### Landing: follow a 20m guidance line and land on the pad (`landing_target_80mm`)
+
+**Expert** (`LineExpert`): touches down 0.05m from the pad centre at
+0.03 m/s.
+
+https://github.com/user-attachments/assets/5ea3c0a0-4e52-42fd-9ba8-5b113a7f7621
+
+**Student** (`models/bc_dagger1_land.pth`): touches down 0.12m from the pad
+centre at 0.03 m/s.
+
+https://github.com/user-attachments/assets/0603c7c7-8220-4bd8-aa44-69d99ec39849
+
+To record your own, pass `--record-dir=DIR` to `nanopilot/eval_flight.py`. It
+saves every frame the pilot sees as `DIR/epNN/NNNNN.jpg`. Then join a run's
+frames into a video:
+
+```bash
+ffmpeg -framerate 20 -i DIR/ep01/%05d.jpg -c:v libx264 -pix_fmt yuv420p out.mp4
+```
 
 ## Model updates
 
