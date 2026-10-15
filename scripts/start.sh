@@ -123,9 +123,10 @@ PYEOF
 }
 
 start_betaflight() {
-    # BetaFlight SITL on macOS ARM64 intermittently aborts during TCP serial
-    # init (heap corruption in openSerialPort/stream_initAddress). Random per
-    # launch, so retry generously.
+    # BetaFlight SITL aborts during TCP serial init about half the time: a
+    # race between sitl.c's unlocked dyad_update() thread and the main
+    # thread's dyad_newStream()/dyad_listenEx() (see AGENTS.md). Timing-
+    # dependent per launch, so retry generously.
     #
     # `kill -0` is NOT a sufficient test. A launch can clear it and still be
     # MSP-deaf: the process is alive, port 5761 accepts connections, and every
@@ -145,8 +146,11 @@ start_betaflight() {
             echo "BetaFlight SITL running (PID $BF_PID), MSP responding."
             return 0
         fi
-        kill -9 "$BF_PID" 2>/dev/null
-        wait "$BF_PID" 2>/dev/null
+        # `|| true` on both: a crashed BF is already reaped, so kill fails and
+        # wait returns its signal status -- either trips `set -e` and kills
+        # start.sh on the first crash, which is the case this loop exists for.
+        kill -9 "$BF_PID" 2>/dev/null || true
+        wait "$BF_PID" 2>/dev/null || true
         if [ "$attempt" -lt "$max_attempts" ]; then
             echo "BetaFlight dead or MSP-deaf on attempt $attempt, retrying..."
             sleep 2
