@@ -57,8 +57,7 @@ failing the other way first:
 
 ## 2. The method: scripted expert -> behaviour cloning -> DAgger
 
-Three stages. Each exists because the one before it is insufficient in a way
-that was measured here, not assumed.
+Three stages. Each exists because the one before it is insufficient in a measurable way.
 
 ```
   privileged state                  camera pixels
