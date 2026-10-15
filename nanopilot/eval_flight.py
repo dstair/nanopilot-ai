@@ -36,9 +36,11 @@ import xml.etree.ElementTree as ET
 
 import donkeycar as dk
 import numpy as np
+from PIL import Image
 
 from autonomous_collect import _wait_for_ready, _wait_for_tcp
 from drone_env import build_drone_env
+from gate_expert import GateExpert
 from line_expert import LineExpert
 from rl_env import takeoff as rl_takeoff
 from torch_pilot import TorchPilot
@@ -377,6 +379,17 @@ def fly_episode(env, pilot, args, gates, pad_xy, task, expert=None):
     if pilot is not None:
         pilot._imu_history[:] = 0.0
     tracker = GateTracker(gates) if task == "gates" else None
+    # GateExpert's target gate. Advances on ANY crossing of the current gate's
+    # plane, pass or miss, exactly as GateChaseEnv does -- that is the labelling
+    # the students were trained on, and it never sends the drone back behind a
+    # missed gate.
+    gate_idx = 0
+    prev_gate_lx = None
+    frame_dir = None
+    if args.record_dir:
+        frame_dir = os.path.join(args.record_dir, f"ep{args._episode:02d}")
+        os.makedirs(frame_dir, exist_ok=True)
+    n_frames = 0
     track = []
     blank_frames = 0
     result = "survived"
@@ -446,7 +459,25 @@ def fly_episode(env, pilot, args, gates, pad_xy, task, expert=None):
 
         if not np.any(image):
             blank_frames += 1
-        if expert is not None:
+        elif frame_dir is not None:
+            # Exactly the frame the pilot is handed this step (the expert
+            # ignores it), so a video shows what a student had to act on.
+            Image.fromarray(image).save(
+                os.path.join(frame_dir, f"{n_frames:05d}.jpg"), quality=92)
+            n_frames += 1
+        if isinstance(expert, GateExpert):
+            g = gates[gate_idx]
+            lx = (math.cos(g["yaw"]) * (pos[0] - g["x"])
+                  + math.sin(g["yaw"]) * (pos[1] - g["y"]))
+            if prev_gate_lx is not None and prev_gate_lx < 0.0 <= lx:
+                gate_idx = min(gate_idx + 1, len(gates) - 1)
+                g = gates[gate_idx]
+                lx = (math.cos(g["yaw"]) * (pos[0] - g["x"])
+                      + math.sin(g["yaw"]) * (pos[1] - g["y"]))
+            prev_gate_lx = lx
+            yaw, pitch, roll, altitude = expert.act(
+                pos, math.radians(att[2]), gate_idx)
+        elif expert is not None:
             # Privileged state, no image: the scripted expert is a pure
             # function of pose, which is what makes it a free DAgger labeller.
             yaw, pitch, roll, altitude = expert.act(pos, math.radians(att[2]))
@@ -678,11 +709,22 @@ def evaluate(cfg, args):
         env.altitude_trim_range = float(args.trim_range)
 
     expert = None
-    if args.expert:
+    if args.expert and task == "gates":
+        expert = GateExpert.from_env(
+            env, gates,
+            cruise_speed=args.cruise_speed,
+            lookahead=args.lookahead,
+            height_gain=args.height_gain,
+        )
+        print(
+            f"GateExpert: {len(gates)} gates cruise {args.cruise_speed} m/s "
+            f"lookahead {args.lookahead}m Kz {args.height_gain}"
+        )
+    elif args.expert:
         if task != "land":
             raise SystemExit(
-                f"--expert flies the scripted LineExpert, which needs the land "
-                f"task; this world scored as '{task}'."
+                f"--expert flies GateExpert on gate courses and LineExpert on "
+                f"the land task; this world scored as '{task}'."
             )
         expert = LineExpert.from_env(
             env, SPAWN[:2], pad_xy,
@@ -733,6 +775,7 @@ def evaluate(cfg, args):
                     f"{args.start_alt}m within {args.takeoff_timeout}s"
                 )
                 continue
+            args._episode = i + 1
             episode = fly_episode(env, pilot, args, gates, pad_xy, task, expert)
             episode["episode"] = i + 1
             episodes.append(episode)
@@ -770,7 +813,7 @@ def evaluate(cfg, args):
         update_thread.join(timeout=3.0)
 
     report = {
-        "model": args.model or "scripted:LineExpert",
+        "model": args.model or f"scripted:{type(expert).__name__}",
         "world": world,
         "task": task,
         "airframe": args.airframe,
@@ -807,8 +850,9 @@ def main():
     parser = argparse.ArgumentParser(description="Closed-loop Nanopilot autopilot eval")
     parser.add_argument("--model", default=None, help="TorchPilot .pth checkpoint")
     parser.add_argument("--expert", action="store_true",
-                        help="fly the scripted LineExpert instead of a "
-                             "checkpoint, scored by the same rules. Use this to "
+                        help="fly the scripted expert instead of a checkpoint "
+                             "(GateExpert on gate courses, LineExpert on the "
+                             "land task), scored by the same rules. Use this to "
                              "establish the ceiling before distilling anything")
     parser.add_argument("--trim-range", type=float, default=None, metavar="M",
                         help="override DRONE_ALTITUDE_TRIM_RANGE in flight, "
@@ -865,6 +909,9 @@ def main():
                         help="multiply the altitude command by G in THRUST/PWM space "
                              "(raw command is scaled by G**5). Diagnostic for a "
                              "student whose control law is right but gain too low.")
+    parser.add_argument("--record-dir", default=None, metavar="DIR",
+                        help="save every camera frame the pilot sees as "
+                             "DIR/epNN/NNNNN.jpg, one per control step")
     parser.add_argument("--trace", action="store_true",
                         help="store the per-step z / vz / altitude-command trace in the "
                              "metrics JSON (for oscillation period & phase analysis)")
