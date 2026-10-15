@@ -40,6 +40,7 @@ import numpy as np
 from autonomous_collect import _wait_for_ready, _wait_for_tcp
 from drone_env import build_drone_env
 from line_expert import LineExpert
+from rl_env import takeoff as rl_takeoff
 from torch_pilot import TorchPilot
 
 # Matches the hardcoded teleport target in DroneGymEnv._do_reset.
@@ -352,44 +353,17 @@ def settle(env, seconds):
 def takeoff(env, args):
     """Climb to the episode start altitude before handing over to the pilot.
 
-    Returns True once altitude is reached, False on timeout.
+    Shares rl_env.takeoff with the collectors, so a policy is scored from the
+    same starting state it was trained on. The old local version powered all
+    the way to start_alt (~0.9m overshoot, then a slow sink back) and handed
+    over on "within 0.15m and |vz| < 0.15", which the drone satisfies on the
+    way THROUGH -- it then rang +-0.12m all flight (see rl_env._arrest_climb).
+
+    Returns True once settled at start_alt, False on timeout.
     """
-    deadline = time.time() + args.takeoff_timeout
-    while time.time() < deadline:
-        outputs = env.run_threaded(0.0, 0.0, 0.0, 0.0, direct_thrust=args.climb_altitude)
-        if outputs[POS][2] >= args.start_alt:
-            break
-        time.sleep(0.02)
-    else:
-        return False
-
-    # Arrest the climb before handing over. A fixed 0.5s hold was not enough:
-    # momentum carried the drone ~0.9m past start_alt, and because the altitude
-    # hold anchors its setpoint wherever the command last sat outside the
-    # deadband, episodes began at 2.3-2.4m instead of 1.5m -- above the gates,
-    # with only the trim range to recover. Wait for real calm instead.
-    calm = 0
-    while time.time() < deadline:
-        outputs = env.run_threaded(0.0, 0.0, 0.0, 0.0)
-        if abs(outputs[VEL][2]) < 0.15:
-            calm += 1
-            if calm >= 4:
-                break
-        else:
-            calm = 0
-        time.sleep(0.05)
-
-    # Then put the hold exactly on start_alt and let the PD fly it there, so
-    # every episode begins from the same height regardless of overshoot.
-    if getattr(env, "altitude_hold_kp", 0.0) > 0.0:
-        env.set_altitude_setpoint(args.start_alt)
-        while time.time() < deadline:
-            outputs = env.run_threaded(0.0, 0.0, 0.0, 0.0)
-            if abs(outputs[POS][2] - args.start_alt) < 0.15 and abs(outputs[VEL][2]) < 0.15:
-                break
-            time.sleep(0.05)
-    settle(env, 0.3)
-    return True
+    return rl_takeoff(
+        env, start_alt=args.start_alt, climb_altitude=args.climb_altitude,
+        takeoff_timeout=args.takeoff_timeout)
 
 
 def fly_episode(env, pilot, args, gates, pad_xy, task, expert=None):
@@ -874,10 +848,11 @@ def main():
     )
     parser.add_argument("--runs", type=int, default=3, help="episodes to fly")
     parser.add_argument("--duration", type=float, default=30.0, help="max seconds per episode")
-    parser.add_argument("--warmup", type=float, default=6.0, help="hover settle before each episode")
+    parser.add_argument("--warmup", type=float, default=1.0, help="on-ground settle after each reset, before takeoff (GateChaseEnv settle_s)")
     parser.add_argument("--start-alt", type=float, default=1.5, help="takeoff to this altitude before handing over (m)")
-    parser.add_argument("--climb-altitude", type=float, default=0.15, help="normalized altitude command during takeoff")
-    parser.add_argument("--takeoff-timeout", type=float, default=10.0)
+    parser.add_argument("--climb-altitude", type=float, default=0.6, help="cap on the takeoff thrust ramp (direct_thrust), as in GateChaseEnv")
+    parser.add_argument("--takeoff-timeout", type=float, default=15.0,
+                        help="climb + arrest budget (the at-rest handover wait is separate)")
     parser.add_argument("--rate-hz", type=int, default=30)
     parser.add_argument("--ready-timeout", type=float, default=30.0)
     parser.add_argument("--reset-timeout", type=float, default=10.0)

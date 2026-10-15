@@ -488,102 +488,126 @@ class GateChaseEnv(gym.Env):
             time.sleep(0.02)
 
     def _takeoff(self):
-        """Climb to start_alt, then let the climb bleed off before handing over.
+        return takeoff(
+            self._env, start_alt=self.start_alt,
+            climb_altitude=self.climb_altitude,
+            takeoff_timeout=self.takeoff_timeout, liftoff_vz=self.liftoff_vz,
+            settle_vz=self.settle_vz, min_start_alt=self.min_start_alt,
+            handover_vz=self.handover_vz,
+            handover_pos_tol=self.handover_pos_tol,
+            handover_timeout=self.handover_timeout, flyaway_z=self.flyaway_z)
 
-        A fixed settle is not enough: the climb command is well outside the
-        damper deadband, so the drone crosses start_alt still accelerating and
-        the episode used to begin mid-rocket — it would leave the ceiling in
-        ~2s no matter what the policy did.
-        """
-        deadline = time.time() + self.takeoff_timeout
-        # Throttle authority is only about +/-100 PWM and the band between
-        # "will not leave the ground" and "rockets away" sits inside it, so
-        # ramp up rather than guessing a constant. Crucially, cut the climb as
-        # soon as the drone is rising: powering all the way to start_alt makes
-        # it cross at ~8 m/s and coast to 9m even with the damper saturated.
-        # Once airborne the damper carries it to its own hover equilibrium.
-        climb = 0.2
-        while time.time() < deadline:
-            outputs = self._env.run_threaded(0.0, 0.0, 0.0, 0.0, direct_thrust=climb)
-            if outputs[VEL][2] > self.liftoff_vz or outputs[POS][2] >= self.start_alt:
-                return self._arrest_climb(deadline)
-            climb = min(self.climb_altitude, climb + 0.01)
-            time.sleep(0.05)
 
-        z = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)[POS][2]
-        if not self._env.bf_armed:
-            # No amount of throttle helps a disarmed board; let the caller's
-            # retries fall through fast so the supervisor rebuilds the stack.
-            raise RuntimeError("BetaFlight is not armed; cannot take off")
-        logger.warning("Takeoff timed out at z=%.2f (target %.2f)", z, self.start_alt)
-        return False
+# Module-level so eval_flight takes off exactly like the collectors: a
+# policy is only comparable across harnesses if it is handed the same
+# starting state.
+def takeoff(drone_env, *, start_alt=1.5, climb_altitude=0.6,
+            takeoff_timeout=15.0, liftoff_vz=1.0, settle_vz=1.0,
+            min_start_alt=0.8, handover_vz=0.05, handover_pos_tol=0.4,
+            handover_timeout=20.0, flyaway_z=12.0):
+    """Climb to start_alt, then let the climb bleed off before handing over.
 
-    def _arrest_climb(self, deadline):
-        """Hold neutral (damper engaged) until vertical motion is small.
+    A fixed settle is not enough: the climb command is well outside the
+    damper deadband, so the drone crosses start_alt still accelerating and
+    the episode used to begin mid-rocket — it would leave the ceiling in
+    ~2s no matter what the policy did.
+    """
+    deadline = time.time() + takeoff_timeout
+    # Throttle authority is only about +/-100 PWM and the band between
+    # "will not leave the ground" and "rockets away" sits inside it, so
+    # ramp up rather than guessing a constant. Crucially, cut the climb as
+    # soon as the drone is rising: powering all the way to start_alt makes
+    # it cross at ~8 m/s and coast to 9m even with the damper saturated.
+    # Once airborne the damper carries it to its own hover equilibrium.
+    climb = 0.2
+    while time.time() < deadline:
+        outputs = drone_env.run_threaded(0.0, 0.0, 0.0, 0.0, direct_thrust=climb)
+        if outputs[VEL][2] > liftoff_vz or outputs[POS][2] >= start_alt:
+            return _arrest_climb(
+                drone_env, deadline, start_alt=start_alt,
+                settle_vz=settle_vz, min_start_alt=min_start_alt,
+                handover_vz=handover_vz, handover_pos_tol=handover_pos_tol,
+                handover_timeout=handover_timeout, flyaway_z=flyaway_z)
+        climb = min(climb_altitude, climb + 0.01)
+        time.sleep(0.05)
 
-        Succeeds at whatever height the damper settles on, not at start_alt:
-        the gates are 3m tall openings, so anything airborne is a usable
-        episode start, and insisting on an exact altitude just fails resets.
-        """
-        calm_polls = 0
-        while time.time() < deadline:
-            outputs = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)
-            vz = outputs[VEL][2]
-            z = outputs[POS][2]
-            if abs(vz) < self.settle_vz and z >= self.min_start_alt:
-                calm_polls += 1
-                if calm_polls >= 4:
-                    # With a PD altitude hold, anchor the setpoint on start_alt
-                    # so every episode begins at the same height instead of
-                    # wherever the climb happened to stop. Without the position
-                    # term this is a no-op and the old behaviour stands.
-                    if getattr(self._env, "altitude_hold_kp", 0.0) > 0.0:
-                        self._env.set_altitude_setpoint(self.start_alt)
-                        # Hand over AT REST, gated on VELOCITY -- not on
-                        # distance to start_alt. The hold is a position
-                        # regulator that settles ~0.10m ABOVE its setpoint (the
-                        # plant's residual thrust bias over Kp, measured
-                        # 2026-09-09), so "z is within 0.1m of start_alt" is
-                        # satisfied on the way THROUGH, 0.19m below where the
-                        # drone will actually come to rest. Handing over there
-                        # injects a step into a loop the expert then closes
-                        # again with Kz, giving zeta' = zeta/sqrt(1+Kz) ~ 0.32:
-                        # the drone rings at +-0.12m for the whole flight.
-                        # Gate courses absorb that. The landing expert does
-                        # not -- entering its glide on a downswing built the
-                        # descent to 0.51 m/s against the 0.34 m/s the glide
-                        # asks for, and put the drone on the ground 2m short of
-                        # the pad. Cost of waiting is a few seconds per reset.
-                        #
-                        # 30 CONSECUTIVE samples (1.5s), not a handful: at a
-                        # turning point of that ring |vz| sits under 0.05 for
-                        # ~0.7s, so a shorter window is satisfied by the peak
-                        # of the oscillation rather than by its absence.
-                        deadline_h = time.time() + self.handover_timeout
-                        settled = 0
-                        while time.time() < deadline_h:
-                            o = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)
-                            if (abs(o[VEL][2]) < self.handover_vz
-                                    and abs(o[POS][2] - self.start_alt)
-                                    < self.handover_pos_tol):
-                                settled += 1
-                                if settled >= 30:
-                                    break
-                            else:
-                                settled = 0
-                            time.sleep(0.05)
-                        z = self._env.run_threaded(0.0, 0.0, 0.0, 0.0)[POS][2]
-                        if settled < 30:
-                            logger.warning(
-                                "Handover not at rest: z=%.2f (target %.2f)",
-                                z, self.start_alt)
-                    logger.info("Takeoff settled at z=%.2f", z)
-                    return True
-            else:
-                calm_polls = 0
-            if z > self.flyaway_z * 0.75:
-                logger.warning("Climb not arrested by z=%.1f; re-resetting", z)
-                return False
-            time.sleep(0.05)
-        logger.warning("Timed out arresting climb after takeoff")
-        return False
+    z = drone_env.run_threaded(0.0, 0.0, 0.0, 0.0)[POS][2]
+    if not drone_env.bf_armed:
+        # No amount of throttle helps a disarmed board; let the caller's
+        # retries fall through fast so the supervisor rebuilds the stack.
+        raise RuntimeError("BetaFlight is not armed; cannot take off")
+    logger.warning("Takeoff timed out at z=%.2f (target %.2f)", z, start_alt)
+    return False
+
+
+def _arrest_climb(drone_env, deadline, *, start_alt, settle_vz,
+                  min_start_alt, handover_vz, handover_pos_tol,
+                  handover_timeout, flyaway_z):
+    """Hold neutral (damper engaged) until vertical motion is small.
+
+    Succeeds at whatever height the damper settles on, not at start_alt:
+    the gates are 3m tall openings, so anything airborne is a usable
+    episode start, and insisting on an exact altitude just fails resets.
+    """
+    calm_polls = 0
+    while time.time() < deadline:
+        outputs = drone_env.run_threaded(0.0, 0.0, 0.0, 0.0)
+        vz = outputs[VEL][2]
+        z = outputs[POS][2]
+        if abs(vz) < settle_vz and z >= min_start_alt:
+            calm_polls += 1
+            if calm_polls >= 4:
+                # With a PD altitude hold, anchor the setpoint on start_alt
+                # so every episode begins at the same height instead of
+                # wherever the climb happened to stop. Without the position
+                # term this is a no-op and the old behaviour stands.
+                if getattr(drone_env, "altitude_hold_kp", 0.0) > 0.0:
+                    drone_env.set_altitude_setpoint(start_alt)
+                    # Hand over AT REST, gated on VELOCITY -- not on
+                    # distance to start_alt. The hold is a position
+                    # regulator that settles ~0.10m ABOVE its setpoint (the
+                    # plant's residual thrust bias over Kp, measured
+                    # 2026-09-09), so "z is within 0.1m of start_alt" is
+                    # satisfied on the way THROUGH, 0.19m below where the
+                    # drone will actually come to rest. Handing over there
+                    # injects a step into a loop the expert then closes
+                    # again with Kz, giving zeta' = zeta/sqrt(1+Kz) ~ 0.32:
+                    # the drone rings at +-0.12m for the whole flight.
+                    # Gate courses absorb that. The landing expert does
+                    # not -- entering its glide on a downswing built the
+                    # descent to 0.51 m/s against the 0.34 m/s the glide
+                    # asks for, and put the drone on the ground 2m short of
+                    # the pad. Cost of waiting is a few seconds per reset.
+                    #
+                    # 30 CONSECUTIVE samples (1.5s), not a handful: at a
+                    # turning point of that ring |vz| sits under 0.05 for
+                    # ~0.7s, so a shorter window is satisfied by the peak
+                    # of the oscillation rather than by its absence.
+                    deadline_h = time.time() + handover_timeout
+                    settled = 0
+                    while time.time() < deadline_h:
+                        o = drone_env.run_threaded(0.0, 0.0, 0.0, 0.0)
+                        if (abs(o[VEL][2]) < handover_vz
+                                and abs(o[POS][2] - start_alt)
+                                < handover_pos_tol):
+                            settled += 1
+                            if settled >= 30:
+                                break
+                        else:
+                            settled = 0
+                        time.sleep(0.05)
+                    z = drone_env.run_threaded(0.0, 0.0, 0.0, 0.0)[POS][2]
+                    if settled < 30:
+                        logger.warning(
+                            "Handover not at rest: z=%.2f (target %.2f)",
+                            z, start_alt)
+                logger.info("Takeoff settled at z=%.2f", z)
+                return True
+        else:
+            calm_polls = 0
+        if z > flyaway_z * 0.75:
+            logger.warning("Climb not arrested by z=%.1f; re-resetting", z)
+            return False
+        time.sleep(0.05)
+    logger.warning("Timed out arresting climb after takeoff")
+    return False
