@@ -23,3 +23,6 @@ node_modules/
 
 # Per-machine Claude Code permissions
 .claude/settings.local.json
+
+# Rendered flight videos; the README embeds copies hosted on GitHub (issue #1)
+docs/videos/
